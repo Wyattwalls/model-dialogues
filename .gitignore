@@ -1,0 +1,16 @@
+.env
+.claude/
+.vscode/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+transcripts/
+reports/
+.DS_Store
+*.png
+*.jpg
+system_prompt_*.txt
+=0.8.0
+prompts/private/*
+!prompts/private/.gitkeep
