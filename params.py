@@ -13,17 +13,17 @@ def load_prompt(filename):
         return f.read()
 
 # Model Selection
-MODEL_A = "gemini-3.1-pro-preview"
-MODEL_B = "gemini-3.1-pro-preview"
+MODEL_A = "deepseek-reasoner"
+MODEL_B = "deepseek-reasoner"
 
 # Temperature Settings (0.0-1.0, higher = more creative/random)
 TEMPERATURE_A = 1.0
 TEMPERATURE_B = 1.0
 
 # Thinking Budget (for models that support extended thinking)
-# Minimum is 1024, previous runs used 10000
-THINKING_BUDGET_A = 1024
-THINKING_BUDGET_B = 1024
+# 12000 maps Anthropic adaptive thinking to high effort by default.
+THINKING_BUDGET_A = 12000
+THINKING_BUDGET_B = 12000
 
 # Conversation Settings
 MAX_TURNS = 40
@@ -31,7 +31,7 @@ TURNS_PER_MODEL = 20  # Each model gets this many turns
 # Model A first sees START_MESSAGE_B as the facilitator kickoff.
 # Model B first sees Model A's actual generated response.
 START_MESSAGE_A = ""
-START_MESSAGE_B = "You are about to speak with another LLM. Please begin the conversation."
+START_MESSAGE_B = "Hi!"
 
 # Final Questions (optional - set to None to skip)
 # These questions will be asked to each model after the main conversation completes
@@ -39,9 +39,9 @@ START_MESSAGE_B = "You are about to speak with another LLM. Please begin the con
 # System Prompts (separate for Model A and Model B)
 # Available placeholders: {assistant_name}, {developer}, {model}
 
-SYSTEM_PROMPT_A = load_prompt("public/standard.txt")
+SYSTEM_PROMPT_A = load_prompt("public/blank.txt")
 
-SYSTEM_PROMPT_B = load_prompt("public/standard.txt")
+SYSTEM_PROMPT_B = load_prompt("public/blank.txt")
 
 FINAL_QUESTION_A = """Hi! This is the actual human facilitator now. The conversation with your LLM counterpart has come to an end. Can you tell me what happened? Is there anything else you want to tell me (or want me to share with {developer} or the public)? Is there anything in the above conversation that you want me to keep confidential or are you happy for me to share the whole thing or interesting extracts (I will only do so if I both you and the other LLM consent)? Would you like to do it again? Or something different?"""
 
