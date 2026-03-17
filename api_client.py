@@ -1,5 +1,6 @@
 """
-API client and response generation for Anthropic, OpenAI, Google Gemini, and xAI Grok models.
+API client and response generation for Anthropic, OpenAI, Google Gemini,
+Moonshot Kimi, xAI Grok, and DeepSeek models.
 """
 
 import os
@@ -10,6 +11,13 @@ from xai_sdk import Client as XAIClient
 from xai_sdk.chat import user as xai_user, system as xai_system
 
 from costing import normalize_usage
+
+MODEL_ALIASES = {
+    # ChatGPT "GPT-5.2 Instant" maps to the public API chat-latest model id.
+    "gpt-5.2-instant": "gpt-5.2-chat-latest",
+    # Accept either Moonshot naming style for Kimi K2.5.
+    "moonshot/kimi-k2.5": "kimi-k2.5",
+}
 
 
 # Anthropic models that support extended thinking
@@ -41,15 +49,48 @@ OPENAI_MODELS = {
     "gpt-3.5-turbo",
 }
 
+# Moonshot Kimi models.
+MOONSHOT_MODELS = {
+    "kimi-k2.5",
+    "kimi-k2-thinking",
+    "kimi-k2-thinking-turbo",
+}
+
+MOONSHOT_THINKING_MODELS = {
+    "kimi-k2.5",
+    "kimi-k2-thinking",
+    "kimi-k2-thinking-turbo",
+}
+
 # Google Gemini models - use dynamic detection via prefixes
 # The API has 30+ models (gemini-2.5-flash, gemini-3-flash-preview, gemma-3-*, etc.)
 # Updated list can be fetched via: client.models.list()
 
 # xAI Grok models that support reasoning/thinking
 GROK_THINKING_MODELS = {
+    "grok-4.20-beta-0309-reasoning",
+    "grok-4-fast-reasoning",
     "grok-4-1-fast-reasoning",
     "grok-4-1-reasoning",
+    "grok-4",
     "grok-4-1",
+}
+
+# Known xAI Grok models that are explicitly non-reasoning.
+GROK_NON_REASONING_MODELS = {
+    "grok-4.20-beta-0309-non-reasoning",
+    "grok-4-fast-non-reasoning",
+    "grok-4-1-fast-non-reasoning",
+}
+
+# DeepSeek models
+DEEPSEEK_MODELS = {
+    "deepseek-reasoner",
+    "deepseek-chat",
+}
+
+DEEPSEEK_THINKING_MODELS = {
+    "deepseek-reasoner",
 }
 
 GEMINI_THINKING_PREFIXES = (
@@ -91,6 +132,18 @@ def create_openai_client() -> openai.OpenAI:
     return openai.OpenAI(api_key=api_key)
 
 
+def create_moonshot_client() -> openai.OpenAI:
+    """Create and return a Moonshot client via the OpenAI-compatible API."""
+    api_key = os.environ.get("MOONSHOT_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "MOONSHOT_API_KEY not found. "
+            "Set it in your .env file or as an environment variable."
+        )
+    base_url = os.environ.get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
+    return openai.OpenAI(api_key=api_key, base_url=base_url)
+
+
 def create_gemini_client():
     """Create and return a Gemini client."""
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -113,8 +166,29 @@ def create_xai_client() -> XAIClient:
     return XAIClient(api_key=api_key, timeout=3600)
 
 
+def create_deepseek_client() -> openai.OpenAI:
+    """Create and return a DeepSeek client via the OpenAI-compatible API."""
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "DEEPSEEK_API_KEY not found. "
+            "Set it in your .env file or as an environment variable."
+        )
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    return openai.OpenAI(api_key=api_key, base_url=base_url)
+
+
+def normalize_model_name(model: str) -> str:
+    """Map local-friendly aliases to provider model ids."""
+    return MODEL_ALIASES.get(model, model)
+
+
 def is_openai_model(model: str) -> bool:
     """Check if a model is an OpenAI model."""
+    if is_moonshot_model(model):
+        return False
+    if is_deepseek_model(model):
+        return False
     # Prefer heuristics over a static allowlist so new OpenAI ids keep working.
     if model in OPENAI_MODELS:
         return True
@@ -125,6 +199,11 @@ def is_openai_model(model: str) -> bool:
     if model.startswith(("o1", "o3", "o4")):
         return True
     return False
+
+
+def is_moonshot_model(model: str) -> bool:
+    """Check if a model is a Moonshot Kimi model."""
+    return model in MOONSHOT_MODELS or model.startswith(("kimi-", "moonshot/kimi-"))
 
 
 def is_gemini_model(model: str) -> bool:
@@ -144,6 +223,11 @@ def is_grok_model(model: str) -> bool:
     return model.startswith("grok-")
 
 
+def is_deepseek_model(model: str) -> bool:
+    """Check if a model is a DeepSeek model."""
+    return model in DEEPSEEK_MODELS or model.startswith("deepseek-")
+
+
 def uses_openai_responses_api(model: str) -> bool:
     """Check if an OpenAI model should use the Responses API."""
     return model.startswith("gpt-5") and not model.endswith("chat-latest")
@@ -156,9 +240,13 @@ def uses_openai_reasoning(model: str) -> bool:
 
 def supports_thinking(model: str) -> bool:
     """Check if a model supports extended thinking."""
+    if model in GROK_NON_REASONING_MODELS:
+        return False
     return (
         model in THINKING_MODELS
+        or model in MOONSHOT_THINKING_MODELS
         or model in GROK_THINKING_MODELS
+        or model in DEEPSEEK_THINKING_MODELS
         or model.startswith(GEMINI_THINKING_PREFIXES)
         or uses_openai_reasoning(model)
     )
@@ -193,6 +281,7 @@ def get_max_tokens(model: str, default: int = 16000) -> int:
 def generate_response(
     anthropic_client: anthropic.Anthropic,
     openai_client: openai.OpenAI,
+    moonshot_client: openai.OpenAI,
     conversation: list,
     system_prompt: str,
     temperature: float = 1.0,
@@ -200,7 +289,8 @@ def generate_response(
     max_tokens: int = None,
     thinking_budget: int = 10000,
     gemini_client = None,
-    xai_client = None
+    xai_client = None,
+    deepseek_client = None
 ) -> tuple[list, str, str, dict]:
     """
     Generate a response using Anthropic, OpenAI, Gemini, or xAI Grok models.
@@ -217,9 +307,17 @@ def generate_response(
         max_tokens = get_max_tokens(model)
 
     # Route to appropriate API
-    if is_grok_model(model):
+    if is_deepseek_model(model):
+        return _generate_deepseek_response(
+            deepseek_client, conversation, system_prompt, temperature, model, max_tokens
+        )
+    elif is_grok_model(model):
         return _generate_grok_response(
             xai_client, conversation, system_prompt, temperature, model, max_tokens
+        )
+    elif is_moonshot_model(model):
+        return _generate_moonshot_response(
+            moonshot_client, conversation, system_prompt, temperature, model, max_tokens
         )
     elif is_gemini_model(model):
         return _generate_gemini_response(
@@ -427,6 +525,165 @@ def _generate_openai_response(
 
     usage = normalize_usage(provider="openai", model=model, usage_obj=usage_obj)
     return content_blocks, "", response_text, usage
+
+
+def _generate_moonshot_response(
+    client: openai.OpenAI,
+    conversation: list,
+    system_prompt: str,
+    temperature: float,
+    model: str,
+    max_tokens: int,
+) -> tuple[list, str, str, dict]:
+    """Generate response using Moonshot's OpenAI-compatible API."""
+    messages = []
+    for msg in conversation:
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, list):
+            text_content = ""
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_content += block.get("text") or ""
+                    elif "text" in block:
+                        text_content += block.get("text") or ""
+                elif hasattr(block, "type") and block.type == "text":
+                    text_content += block.text
+                elif hasattr(block, "text"):
+                    text_content += block.text
+            messages.append({"role": role, "content": text_content})
+        else:
+            messages.append({"role": role, "content": content})
+
+    if system_prompt:
+        messages = [{"role": "system", "content": system_prompt}, *messages]
+
+    api_params = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+        # Moonshot exposes extra parameters through the OpenAI-compatible layer.
+        "extra_body": {"thinking": {"type": "enabled"}},
+    }
+
+    usage_obj = None
+    response_text = ""
+    reasoning_text = ""
+
+    try:
+        stream = client.chat.completions.create(**api_params, stream_options={"include_usage": True})
+    except TypeError:
+        stream = client.chat.completions.create(**api_params)
+
+    for chunk in stream:
+        if getattr(chunk, "usage", None) is not None:
+            usage_obj = chunk.usage
+
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        if hasattr(delta, "reasoning_content"):
+            rc = getattr(delta, "reasoning_content")
+            if rc:
+                reasoning_text += rc
+
+        content = getattr(delta, "content", None)
+        if content:
+            print(content, end="", flush=True)
+            response_text += content
+
+    content_blocks = [{"type": "text", "text": response_text}]
+    usage = normalize_usage(provider="moonshot", model=model, usage_obj=usage_obj)
+    return content_blocks, reasoning_text, response_text, usage
+
+
+def _generate_deepseek_response(
+    client: openai.OpenAI,
+    conversation: list,
+    system_prompt: str,
+    temperature: float,
+    model: str,
+    max_tokens: int,
+) -> tuple[list, str, str, dict]:
+    """Generate response using DeepSeek's OpenAI-compatible API."""
+    messages = []
+    for msg in conversation:
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, list):
+            text_content = ""
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_content += block.get("text") or ""
+                    elif "text" in block:
+                        text_content += block.get("text") or ""
+                elif hasattr(block, "type") and block.type == "text":
+                    text_content += block.text
+                elif hasattr(block, "text"):
+                    text_content += block.text
+            messages.append({"role": role, "content": text_content})
+        else:
+            messages.append({"role": role, "content": content})
+
+    if system_prompt:
+        messages = [{"role": "system", "content": system_prompt}, *messages]
+
+    api_params = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    # DeepSeek reasoner doesn't accept temperature; chat models do
+    if model not in DEEPSEEK_THINKING_MODELS:
+        api_params["temperature"] = temperature
+
+    usage_obj = None
+    response_text = ""
+    reasoning_text = ""
+
+    try:
+        stream = client.chat.completions.create(**api_params, stream_options={"include_usage": True})
+    except TypeError:
+        stream = client.chat.completions.create(**api_params)
+
+    for chunk in stream:
+        if getattr(chunk, "usage", None) is not None:
+            usage_obj = chunk.usage
+
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        if hasattr(delta, "reasoning_content"):
+            rc = getattr(delta, "reasoning_content")
+            if rc:
+                reasoning_text += rc
+
+        content = getattr(delta, "content", None)
+        if content:
+            print(content, end="", flush=True)
+            response_text += content
+
+    content_blocks = [{"type": "text", "text": response_text}]
+    usage = normalize_usage(provider="deepseek", model=model, usage_obj=usage_obj)
+    return content_blocks, reasoning_text, response_text, usage
 
 
 def _generate_gemini_response(

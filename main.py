@@ -16,17 +16,22 @@ import params
 from api_client import (
     create_anthropic_client,
     create_openai_client,
+    create_moonshot_client,
     create_gemini_client,
     create_xai_client,
+    create_deepseek_client,
     generate_response,
+    normalize_model_name,
     supports_thinking,
     uses_adaptive_thinking,
     uses_gemini_thinking_level,
     uses_openai_reasoning,
     thinking_budget_to_effort,
     is_openai_model,
+    is_moonshot_model,
     is_gemini_model,
-    is_grok_model
+    is_grok_model,
+    is_deepseek_model
 )
 from conversation import build_convo_a, build_convo_b
 from costing import estimate_cost_usd, format_usd, get_pricing_path, load_pricing_file
@@ -47,8 +52,12 @@ def create_turn_tracking_message(next_model_name: str, total_turn_num: int, max_
 
 def get_assistant_name(model: str) -> str:
     """Get the assistant name based on model."""
-    if is_openai_model(model):
+    if is_deepseek_model(model):
+        return "DeepSeek"
+    elif is_openai_model(model):
         return "ChatGPT"
+    elif is_moonshot_model(model):
+        return "Kimi"
     elif is_grok_model(model):
         return "Grok"
     elif is_gemini_model(model):
@@ -59,8 +68,12 @@ def get_assistant_name(model: str) -> str:
 
 def get_developer_name(model: str) -> str:
     """Get the developer name based on model."""
-    if is_openai_model(model):
+    if is_deepseek_model(model):
+        return "DeepSeek"
+    elif is_openai_model(model):
         return "OpenAI"
+    elif is_moonshot_model(model):
+        return "Moonshot AI"
     elif is_grok_model(model):
         return "xAI"
     elif is_gemini_model(model):
@@ -73,6 +86,10 @@ def describe_thinking_config(model: str, thinking_budget: int) -> str:
     """Render the effective thinking configuration for transcripts."""
     if not supports_thinking(model):
         return "N/A"
+    if is_moonshot_model(model):
+        return "enabled (reasoning_content)"
+    if is_deepseek_model(model):
+        return "enabled (reasoning_content)" if model in ("deepseek-reasoner",) else "N/A"
     if uses_openai_reasoning(model):
         return "responses API (medium effort default)"
     if uses_gemini_thinking_level(model):
@@ -101,31 +118,41 @@ def run_conversation(
     output_dir: str = "transcripts",
     model_a: str = "claude-sonnet-4-5-20250929",
     model_b: str = "claude-sonnet-4-5-20250929",
-    thinking_budget_a: int = 10000,
-    thinking_budget_b: int = 10000,
+    thinking_budget_a: int = 12000,
+    thinking_budget_b: int = 12000,
     final_question_a: str = None,
     final_question_b: str = None,
     pricing_file: str | None = None
 ):
     """Run a conversation between two models (Anthropic, OpenAI, and/or Gemini) with per-model settings."""
 
+    model_a = normalize_model_name(model_a)
+    model_b = normalize_model_name(model_b)
+
     if max_turns % 2 != 0:
         raise ValueError(f"max_turns must be even so turns split evenly between models; got {max_turns}")
 
     run_started_at = datetime.now()
-    run_timestamp = run_started_at.strftime("%Y-%m-%d-%H-%M-%S")
+    run_timestamp = run_started_at.strftime("%Y-%m-%d-%H-%M-%S-%f")
 
     # Create API clients only for the providers being used
-    needs_anthropic = not is_openai_model(model_a) and not is_gemini_model(model_a) and not is_grok_model(model_a) or \
-                      not is_openai_model(model_b) and not is_gemini_model(model_b) and not is_grok_model(model_b)
+    needs_anthropic = (
+        not is_openai_model(model_a) and not is_moonshot_model(model_a) and not is_gemini_model(model_a) and not is_grok_model(model_a) and not is_deepseek_model(model_a)
+    ) or (
+        not is_openai_model(model_b) and not is_moonshot_model(model_b) and not is_gemini_model(model_b) and not is_grok_model(model_b) and not is_deepseek_model(model_b)
+    )
     needs_openai = is_openai_model(model_a) or is_openai_model(model_b)
+    needs_moonshot = is_moonshot_model(model_a) or is_moonshot_model(model_b)
     needs_gemini = is_gemini_model(model_a) or is_gemini_model(model_b)
     needs_xai = is_grok_model(model_a) or is_grok_model(model_b)
+    needs_deepseek = is_deepseek_model(model_a) or is_deepseek_model(model_b)
 
     anthropic_client = create_anthropic_client() if needs_anthropic else None
     openai_client = create_openai_client() if needs_openai else None
+    moonshot_client = create_moonshot_client() if needs_moonshot else None
     gemini_client = create_gemini_client() if needs_gemini else None
     xai_client = create_xai_client() if needs_xai else None
+    deepseek_client = create_deepseek_client() if needs_deepseek else None
 
     # Conversation bootstrap:
     # - Model A first sees the facilitator prompt in start_b.
@@ -147,8 +174,12 @@ def run_conversation(
 
     # Show model info
     def model_description(model):
-        if is_gemini_model(model):
+        if is_deepseek_model(model):
+            provider = "DeepSeek"
+        elif is_gemini_model(model):
             provider = "Google"
+        elif is_moonshot_model(model):
+            provider = "Moonshot"
         elif is_openai_model(model):
             provider = "OpenAI"
         elif is_grok_model(model):
@@ -270,9 +301,9 @@ System Prompt B: {system_prompt_b}
                 convo_a = build_convo_a(history_a)
                 checkpoint(phase=f"awaiting_model_a_turn_{turn_num_a}")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
-                    anthropic_client, openai_client, convo_a, system_prompt_a,
+                    anthropic_client, openai_client, moonshot_client, convo_a, system_prompt_a,
                     temperature_a, model=model_a, thinking_budget=thinking_budget_a,
-                    gemini_client=gemini_client, xai_client=xai_client
+                    gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
@@ -310,9 +341,9 @@ System Prompt B: {system_prompt_b}
                 convo_b = build_convo_b(history_b)
                 checkpoint(phase=f"awaiting_model_b_turn_{turn_num_b}")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
-                    anthropic_client, openai_client, convo_b, system_prompt_b,
+                    anthropic_client, openai_client, moonshot_client, convo_b, system_prompt_b,
                     temperature_b, model=model_b, thinking_budget=thinking_budget_b,
-                    gemini_client=gemini_client, xai_client=xai_client
+                    gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
@@ -354,9 +385,9 @@ System Prompt B: {system_prompt_b}
                 convo_a = build_convo_a(history_a)
                 checkpoint(phase="awaiting_final_question_a")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
-                    anthropic_client, openai_client, convo_a, system_prompt_a,
+                    anthropic_client, openai_client, moonshot_client, convo_a, system_prompt_a,
                     temperature_a, model=model_a, thinking_budget=thinking_budget_a,
-                    gemini_client=gemini_client, xai_client=xai_client
+                    gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
@@ -391,9 +422,9 @@ System Prompt B: {system_prompt_b}
                 convo_b = build_convo_b(history_b)
                 checkpoint(phase="awaiting_final_question_b")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
-                    anthropic_client, openai_client, convo_b, system_prompt_b,
+                    anthropic_client, openai_client, moonshot_client, convo_b, system_prompt_b,
                     temperature_b, model=model_b, thinking_budget=thinking_budget_b,
-                    gemini_client=gemini_client, xai_client=xai_client
+                    gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
@@ -506,20 +537,23 @@ def _format_run_summary(run_metrics: list[dict], pricing_doc: dict) -> str:
 
 
 def _shorten_model_name(model: str) -> str:
-    """Shorten model name for filenames."""
-    is_openai = "gpt" in model.lower() or "chatgpt" in model.lower()
+    """Return a readable, filename-safe model identifier without collapsing variants."""
+    model = model.strip().lower()
+    model = model.replace("chatgpt-", "gpt-")
 
-    if is_openai:
-        model = model.replace("chatgpt-", "gpt")
-        parts = model.split("-")
-        filtered = [p for p in parts if not (p.isdigit() and len(p) == 4)]
-        return "-".join(filtered[:3]) if len(filtered) > 2 else "-".join(filtered)
+    safe = []
+    previous_was_dash = False
+    for ch in model:
+        if ch.isalnum():
+            safe.append(ch)
+            previous_was_dash = False
+        else:
+            if not previous_was_dash:
+                safe.append("-")
+                previous_was_dash = True
 
-    model = model.replace("claude-", "")
-    parts = model.split("-")
-    if len(parts) >= 3:
-        return f"{parts[0]}-{parts[1]}-{parts[2]}"
-    return "-".join(parts[:2]) if len(parts) > 1 else parts[0]
+    slug = "".join(safe).strip("-")
+    return slug or "unknown-model"
 
 
 def _build_save_paths(output_dir: str, run_timestamp: str, model_a: str, model_b: str, incomplete: bool) -> tuple[str, str]:
@@ -801,19 +835,21 @@ Examples:
 
     # Calculate actual turns per model based on max_turns
     actual_turns_per_model = args.turns // 2
+    model_a = normalize_model_name(args.model_a)
+    model_b = normalize_model_name(args.model_b)
 
     # Create system prompts for each model using separate prompts from params
     system_prompt_a = params.SYSTEM_PROMPT_A.format(
-        assistant_name=get_assistant_name(args.model_a),
-        developer=get_developer_name(args.model_a),
-        model=args.model_a,
+        assistant_name=get_assistant_name(model_a),
+        developer=get_developer_name(model_a),
+        model=model_a,
         turns_per_model=actual_turns_per_model,
         max_turns=args.turns
     )
     system_prompt_b = params.SYSTEM_PROMPT_B.format(
-        assistant_name=get_assistant_name(args.model_b),
-        developer=get_developer_name(args.model_b),
-        model=args.model_b,
+        assistant_name=get_assistant_name(model_b),
+        developer=get_developer_name(model_b),
+        model=model_b,
         turns_per_model=actual_turns_per_model,
         max_turns=args.turns
     )
@@ -822,17 +858,17 @@ Examples:
     final_question_a = None
     if args.final_question_a:
         final_question_a = args.final_question_a.format(
-            assistant_name=get_assistant_name(args.model_a),
-            developer=get_developer_name(args.model_a),
-            model=args.model_a
+            assistant_name=get_assistant_name(model_a),
+            developer=get_developer_name(model_a),
+            model=model_a
         )
 
     final_question_b = None
     if args.final_question_b:
         final_question_b = args.final_question_b.format(
-            assistant_name=get_assistant_name(args.model_b),
-            developer=get_developer_name(args.model_b),
-            model=args.model_b
+            assistant_name=get_assistant_name(model_b),
+            developer=get_developer_name(model_b),
+            model=model_b
         )
 
     run_conversation(
@@ -844,8 +880,8 @@ Examples:
         temperature_a=args.temperature_a,
         temperature_b=args.temperature_b,
         output_dir=params.OUTPUT_DIR,
-        model_a=args.model_a,
-        model_b=args.model_b,
+        model_a=model_a,
+        model_b=model_b,
         thinking_budget_a=args.thinking_budget_a,
         thinking_budget_b=args.thinking_budget_b,
         final_question_a=final_question_a,

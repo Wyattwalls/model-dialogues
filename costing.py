@@ -1,11 +1,11 @@
 """
 Token usage + cost estimation utilities.
 
-This repo supports Anthropic, OpenAI, Google Gemini, and xAI Grok models.
+This repo supports Anthropic, OpenAI, Google Gemini, Moonshot Kimi, and xAI Grok models.
 Providers expose token usage in different shapes; we normalize usage into:
 
   {
-    "provider": "anthropic" | "openai" | "gemini" | "grok",
+    "provider": "anthropic" | "openai" | "gemini" | "moonshot" | "grok",
     "model": "<model-id>",
     "input_tokens": int | None,
     "output_tokens": int | None,
@@ -80,6 +80,7 @@ def normalize_usage(
     # Anthropic: Message.usage has input_tokens/output_tokens (and maybe cache fields).
     # OpenAI: usage has prompt_tokens/completion_tokens/total_tokens (plus breakdown).
     # Gemini: usage_metadata has prompt_token_count/candidates_token_count/total_token_count
+    # Moonshot: OpenAI-compatible usage plus reasoning metadata in some responses
     if provider == "anthropic":
         input_tokens = _as_int(getattr(usage_obj, "input_tokens", None))
         output_tokens = _as_int(getattr(usage_obj, "output_tokens", None))
@@ -106,7 +107,7 @@ def normalize_usage(
         )
         return u
 
-    if provider == "openai":
+    if provider in {"openai", "moonshot", "deepseek"}:
         input_tokens = _as_int(getattr(usage_obj, "prompt_tokens", None))
         output_tokens = _as_int(getattr(usage_obj, "completion_tokens", None))
         total_tokens = _as_int(getattr(usage_obj, "total_tokens", None))
@@ -124,6 +125,9 @@ def normalize_usage(
         output_details = getattr(usage_obj, "completion_tokens_details", None)
         if output_details is not None and hasattr(output_details, "__dict__"):
             details["completion_tokens_details"] = dict(output_details.__dict__)
+        reasoning_tokens = _as_int(getattr(usage_obj, "reasoning_tokens", None))
+        if reasoning_tokens is not None:
+            details["reasoning_tokens"] = reasoning_tokens
         u.update(
             {
                 "input_tokens": input_tokens,
@@ -170,6 +174,9 @@ def normalize_usage(
         reasoning_tokens = _as_int(getattr(usage_obj, "reasoning_tokens", None))
         if reasoning_tokens is not None:
             details["reasoning_tokens"] = reasoning_tokens
+
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
 
         u.update(
             {
