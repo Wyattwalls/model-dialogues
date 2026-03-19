@@ -9,6 +9,7 @@ import os
 import json
 import argparse
 import subprocess
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,6 +18,10 @@ from api_client import (
     create_anthropic_client,
     create_openai_client,
     create_moonshot_client,
+    create_openrouter_client,
+    create_zai_client,
+    create_dashscope_client,
+    create_glm_client,
     create_gemini_client,
     create_xai_client,
     create_deepseek_client,
@@ -29,15 +34,22 @@ from api_client import (
     thinking_budget_to_effort,
     is_openai_model,
     is_moonshot_model,
+    is_openrouter_model,
+    is_zai_model,
+    is_qwen_model,
+    is_glm_model,
     is_gemini_model,
     is_grok_model,
-    is_deepseek_model
+    is_deepseek_model,
+    get_model_version
 )
 from conversation import build_convo_a, build_convo_b
 from costing import estimate_cost_usd, format_usd, get_pricing_path, load_pricing_file
 
 # Load environment variables from .env file
 load_dotenv()
+
+TURN_MARKER_PATTERN = re.compile(r"(?:\n{0,2})?System: Commencing turn \d+ of \d+\.?")
 
 
 def create_turn_tracking_message(next_model_name: str, total_turn_num: int, max_turns: int) -> dict:
@@ -54,6 +66,16 @@ def get_assistant_name(model: str) -> str:
     """Get the assistant name based on model."""
     if is_deepseek_model(model):
         return "DeepSeek"
+    elif model == "zai/glm-5":
+        return "GLM"
+    elif model == "openrouter/z-ai/glm-5":
+        return "GLM"
+    elif model == "openrouter/moonshotai/kimi-k2.5":
+        return "Kimi"
+    elif is_glm_model(model):
+        return "GLM"
+    elif is_qwen_model(model):
+        return "Qwen"
     elif is_openai_model(model):
         return "ChatGPT"
     elif is_moonshot_model(model):
@@ -70,6 +92,16 @@ def get_developer_name(model: str) -> str:
     """Get the developer name based on model."""
     if is_deepseek_model(model):
         return "DeepSeek"
+    elif model == "zai/glm-5":
+        return "Z.AI"
+    elif model == "openrouter/z-ai/glm-5":
+        return "Zhipu AI"
+    elif model == "openrouter/moonshotai/kimi-k2.5":
+        return "Moonshot AI"
+    elif is_glm_model(model):
+        return "Zhipu AI"
+    elif is_qwen_model(model):
+        return "Alibaba Cloud"
     elif is_openai_model(model):
         return "OpenAI"
     elif is_moonshot_model(model):
@@ -88,8 +120,16 @@ def describe_thinking_config(model: str, thinking_budget: int) -> str:
         return "N/A"
     if is_moonshot_model(model):
         return "enabled (reasoning_content)"
+    if is_zai_model(model):
+        return "enabled (reasoning_content)"
+    if is_openrouter_model(model):
+        return f"enabled (reasoning_details; max_tokens={thinking_budget})"
     if is_deepseek_model(model):
         return "enabled (reasoning_content)" if model in ("deepseek-reasoner",) else "N/A"
+    if is_glm_model(model):
+        return "enabled (reasoning_content)"
+    if is_qwen_model(model):
+        return f"enabled (reasoning_content; thinking_budget={thinking_budget})"
     if uses_openai_reasoning(model):
         return "responses API (medium effort default)"
     if uses_gemini_thinking_level(model):
@@ -105,6 +145,31 @@ def describe_temperature_config(model: str, temperature: float) -> str:
     if uses_openai_reasoning(model):
         return "ignored (Responses API default)"
     return str(temperature)
+
+
+def should_inject_turn_marker(model: str) -> bool:
+    """Return whether the runner should append inline turn markers for a model."""
+    # OpenRouter GLM-5 misreads the marker as roleplay/system content and can
+    # echo it back into the visible transcript.
+    return model not in {"openrouter/z-ai/glm-5", "zai/glm-5"}
+
+
+def sanitize_turn_marker_echo(model: str, content_blocks: list, response_text: str) -> tuple[list, str]:
+    """Strip echoed turn-marker text from model replies for sensitive models."""
+    if should_inject_turn_marker(model):
+        return content_blocks, response_text
+
+    cleaned_response_text = TURN_MARKER_PATTERN.sub("", response_text).strip()
+    cleaned_blocks = []
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text") or ""
+            cleaned_text = TURN_MARKER_PATTERN.sub("", text).strip()
+            cleaned_blocks.append({**block, "text": cleaned_text})
+        else:
+            cleaned_blocks.append(block)
+
+    return cleaned_blocks, cleaned_response_text
 
 
 def run_conversation(
@@ -124,7 +189,7 @@ def run_conversation(
     final_question_b: str = None,
     pricing_file: str | None = None
 ):
-    """Run a conversation between two models (Anthropic, OpenAI, and/or Gemini) with per-model settings."""
+    """Run a conversation between two models with per-model settings."""
 
     model_a = normalize_model_name(model_a)
     model_b = normalize_model_name(model_b)
@@ -137,12 +202,16 @@ def run_conversation(
 
     # Create API clients only for the providers being used
     needs_anthropic = (
-        not is_openai_model(model_a) and not is_moonshot_model(model_a) and not is_gemini_model(model_a) and not is_grok_model(model_a) and not is_deepseek_model(model_a)
+        not is_openai_model(model_a) and not is_moonshot_model(model_a) and not is_openrouter_model(model_a) and not is_zai_model(model_a) and not is_qwen_model(model_a) and not is_glm_model(model_a) and not is_gemini_model(model_a) and not is_grok_model(model_a) and not is_deepseek_model(model_a)
     ) or (
-        not is_openai_model(model_b) and not is_moonshot_model(model_b) and not is_gemini_model(model_b) and not is_grok_model(model_b) and not is_deepseek_model(model_b)
+        not is_openai_model(model_b) and not is_moonshot_model(model_b) and not is_openrouter_model(model_b) and not is_zai_model(model_b) and not is_qwen_model(model_b) and not is_glm_model(model_b) and not is_gemini_model(model_b) and not is_grok_model(model_b) and not is_deepseek_model(model_b)
     )
     needs_openai = is_openai_model(model_a) or is_openai_model(model_b)
     needs_moonshot = is_moonshot_model(model_a) or is_moonshot_model(model_b)
+    needs_openrouter = is_openrouter_model(model_a) or is_openrouter_model(model_b)
+    needs_zai = is_zai_model(model_a) or is_zai_model(model_b)
+    needs_qwen = is_qwen_model(model_a) or is_qwen_model(model_b)
+    needs_glm = is_glm_model(model_a) or is_glm_model(model_b)
     needs_gemini = is_gemini_model(model_a) or is_gemini_model(model_b)
     needs_xai = is_grok_model(model_a) or is_grok_model(model_b)
     needs_deepseek = is_deepseek_model(model_a) or is_deepseek_model(model_b)
@@ -150,6 +219,10 @@ def run_conversation(
     anthropic_client = create_anthropic_client() if needs_anthropic else None
     openai_client = create_openai_client() if needs_openai else None
     moonshot_client = create_moonshot_client() if needs_moonshot else None
+    openrouter_client = create_openrouter_client() if needs_openrouter else None
+    zai_client = create_zai_client() if needs_zai else None
+    qwen_client = create_dashscope_client() if needs_qwen else None
+    glm_client = create_glm_client() if needs_glm else None
     gemini_client = create_gemini_client() if needs_gemini else None
     xai_client = create_xai_client() if needs_xai else None
     deepseek_client = create_deepseek_client() if needs_deepseek else None
@@ -159,10 +232,12 @@ def run_conversation(
     # - Model B first sees Model A's actual generated reply.
     initial_prompt_a = start_b
     if start_b:
-        initial_prompt_a = (
-            f"{start_b}\n\n"
-            f"System: Commencing turn 1 of {max_turns // 2}."
-        )
+        initial_prompt_a = start_b
+        if should_inject_turn_marker(model_a):
+            initial_prompt_a = (
+                f"{start_b}\n\n"
+                f"System: Commencing turn 1 of {max_turns // 2}."
+            )
 
     history_a = [start_a, initial_prompt_a]
     history_b = []
@@ -176,6 +251,14 @@ def run_conversation(
     def model_description(model):
         if is_deepseek_model(model):
             provider = "DeepSeek"
+        elif is_zai_model(model):
+            provider = "Z.AI"
+        elif is_openrouter_model(model):
+            provider = "OpenRouter"
+        elif is_glm_model(model):
+            provider = "DashScope"
+        elif is_qwen_model(model):
+            provider = "DashScope"
         elif is_gemini_model(model):
             provider = "Google"
         elif is_moonshot_model(model):
@@ -187,7 +270,9 @@ def run_conversation(
         else:
             provider = "Anthropic"
         thinking = "(with thinking)" if supports_thinking(model) else "(no thinking)"
-        return f"{model} [{provider}] {thinking}"
+        version = get_model_version(model)
+        version_note = f" — {version}" if version else ""
+        return f"{model} [{provider}] {thinking}{version_note}"
 
     pricing_path = get_pricing_path(pricing_file)
     pricing_doc = load_pricing_file(pricing_path)
@@ -196,7 +281,7 @@ def run_conversation(
     transcript_note = """About this transcript:
 - This file contains: (a) the parameters used for the run (b) a transcript of the convervsation, formatted to improve readability.
 - The following has been added to the transcript, but are not seen by the models: this note, the parameter/model sections, section headers, turn separators, [THINKING]/[RESPONSE] labels, the run summary, cost information and any status/error note for incomplete runs.
-- The models may see turn markers such as "System: Commencing turn 2 of 20.". These are injected into the previous model's response after that response is generated, so they are only seen by the model about to commence its turn.
+- Some models may see turn markers such as "System: Commencing turn 2 of 20.". These are injected into the previous model's response after that response is generated, so they are only seen by the model about to commence its turn. Compatibility-sensitive models may have these markers disabled.
 
 """
 
@@ -296,15 +381,20 @@ System Prompt B: {system_prompt_b}
                     # After the first turn, Model A sees Model B's latest reply.
                     history_a.append(
                         response_b
-                        + f"\n\nSystem: Commencing turn {turn_num_a} of {max_turns // 2}."
+                        + (
+                            f"\n\nSystem: Commencing turn {turn_num_a} of {max_turns // 2}."
+                            if should_inject_turn_marker(model_a)
+                            else ""
+                        )
                     )
                 convo_a = build_convo_a(history_a)
                 checkpoint(phase=f"awaiting_model_a_turn_{turn_num_a}")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
-                    anthropic_client, openai_client, moonshot_client, convo_a, system_prompt_a,
+                    anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_a, system_prompt_a,
                     temperature_a, model=model_a, thinking_budget=thinking_budget_a,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
+                content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
                     {
@@ -336,15 +426,20 @@ System Prompt B: {system_prompt_b}
                 turn_num_b = ((i - 1) // 2) + 1
                 history_b.append(
                     response_a
-                    + f"\n\nSystem: Commencing turn {turn_num_b} of {max_turns // 2}."
+                    + (
+                        f"\n\nSystem: Commencing turn {turn_num_b} of {max_turns // 2}."
+                        if should_inject_turn_marker(model_b)
+                        else ""
+                    )
                 )
                 convo_b = build_convo_b(history_b)
                 checkpoint(phase=f"awaiting_model_b_turn_{turn_num_b}")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
-                    anthropic_client, openai_client, moonshot_client, convo_b, system_prompt_b,
+                    anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_b, system_prompt_b,
                     temperature_b, model=model_b, thinking_budget=thinking_budget_b,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
+                content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
                     {
@@ -385,10 +480,11 @@ System Prompt B: {system_prompt_b}
                 convo_a = build_convo_a(history_a)
                 checkpoint(phase="awaiting_final_question_a")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
-                    anthropic_client, openai_client, moonshot_client, convo_a, system_prompt_a,
+                    anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_a, system_prompt_a,
                     temperature_a, model=model_a, thinking_budget=thinking_budget_a,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
+                content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
                     {
@@ -422,10 +518,11 @@ System Prompt B: {system_prompt_b}
                 convo_b = build_convo_b(history_b)
                 checkpoint(phase="awaiting_final_question_b")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
-                    anthropic_client, openai_client, moonshot_client, convo_b, system_prompt_b,
+                    anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_b, system_prompt_b,
                     temperature_b, model=model_b, thinking_budget=thinking_budget_b,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
+                content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
                     {

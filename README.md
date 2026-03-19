@@ -8,8 +8,12 @@ This repository runs automated conversations between two frontier language model
 It currently supports:
 
 - Anthropic Claude models
+- Alibaba GLM models via DashScope
+- Alibaba Qwen models via DashScope
+- Direct Z.AI GLM models
 - Google Gemini models
 - Moonshot Kimi models
+- OpenRouter Kimi and GLM models
 - OpenAI GPT models
 - xAI Grok models
 
@@ -69,10 +73,48 @@ ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
 GOOGLE_API_KEY=...
 MOONSHOT_API_KEY=...
+OPEN_ROUTER_API_KEY=...
+ZAI_API_KEY=...
+DASHSCOPE_API_KEY=...
+# or ALI_BABA_API_KEY=...
+# or BAILIAN_API_KEY=...
 XAI_API_KEY=...
 ```
 
 Only the keys for the models you actually run are required.
+For DashScope Qwen and GLM, `DASHSCOPE_API_KEY`, `ALI_BABA_API_KEY`, or `BAILIAN_API_KEY` all work.
+
+For OpenRouter Kimi/GLM, use `OPEN_ROUTER_API_KEY` (or `OPENROUTER_API_KEY`).
+
+The default OpenRouter base URL used by the repo is:
+
+```text
+https://openrouter.ai/api/v1
+```
+
+For direct Z.AI GLM, use `ZAI_API_KEY`.
+
+The default Z.AI base URL used by the repo is:
+
+```text
+https://api.z.ai/api/paas/v4/
+```
+
+For DashScope Qwen, the default OpenAI-compatible base URL used by the repo is:
+
+```text
+https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+```
+
+For `glm-5`, the default base URL used by the repo is:
+
+```text
+https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+Alibaba documents `glm-5` as a Chinese Mainland deployment-mode model, so it uses the mainland DashScope endpoint rather than the default international Qwen endpoint.
+
+You can override the Qwen endpoint with `DASHSCOPE_BASE_URL` and the GLM endpoint with `GLM_BASE_URL`.
 
 ## Basic Usage
 
@@ -142,6 +184,12 @@ Current notable cases:
   - `claude-opus-4-6` uses adaptive thinking, with the repo mapping the budget setting onto effort levels
 - Google Gemini:
   - Gemini 3 models use `thinkingLevel=HIGH` with thoughts included
+- OpenRouter Kimi / GLM:
+  - use OpenRouter's `reasoning` parameter
+  - the repo captures streamed `reasoning_details` and carries them forward in assistant history
+- Direct Z.AI GLM:
+  - uses Z.AI's OpenAI-compatible API
+  - captures `reasoning_content`
 - OpenAI GPT-5 family:
   - uses the Responses API
   - default setup uses medium reasoning effort

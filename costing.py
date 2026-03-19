@@ -1,11 +1,13 @@
 """
 Token usage + cost estimation utilities.
 
-This repo supports Anthropic, OpenAI, Google Gemini, Moonshot Kimi, and xAI Grok models.
+This repo supports Anthropic, OpenAI, Google Gemini, Moonshot Kimi,
+OpenRouter Kimi/GLM, direct Z.AI GLM, DashScope Qwen, DashScope GLM,
+DeepSeek, and xAI Grok models.
 Providers expose token usage in different shapes; we normalize usage into:
 
   {
-    "provider": "anthropic" | "openai" | "gemini" | "moonshot" | "grok",
+    "provider": "anthropic" | "openai" | "gemini" | "moonshot" | "openrouter" | "zai" | "qwen" | "glm" | "deepseek" | "grok",
     "model": "<model-id>",
     "input_tokens": int | None,
     "output_tokens": int | None,
@@ -27,6 +29,13 @@ from typing import Any, Optional
 
 @dataclass(frozen=True)
 class ModelPricing:
+    input_per_1m: float
+    output_per_1m: float
+
+
+@dataclass(frozen=True)
+class PricingTier:
+    max_input_tokens: int | None
     input_per_1m: float
     output_per_1m: float
 
@@ -80,7 +89,7 @@ def normalize_usage(
     # Anthropic: Message.usage has input_tokens/output_tokens (and maybe cache fields).
     # OpenAI: usage has prompt_tokens/completion_tokens/total_tokens (plus breakdown).
     # Gemini: usage_metadata has prompt_token_count/candidates_token_count/total_token_count
-    # Moonshot: OpenAI-compatible usage plus reasoning metadata in some responses
+    # Moonshot / OpenRouter / Z.AI / DashScope / GLM / DeepSeek: OpenAI-compatible usage plus reasoning metadata
     if provider == "anthropic":
         input_tokens = _as_int(getattr(usage_obj, "input_tokens", None))
         output_tokens = _as_int(getattr(usage_obj, "output_tokens", None))
@@ -107,7 +116,7 @@ def normalize_usage(
         )
         return u
 
-    if provider in {"openai", "moonshot", "deepseek"}:
+    if provider in {"openai", "moonshot", "openrouter", "zai", "qwen", "glm", "deepseek"}:
         input_tokens = _as_int(getattr(usage_obj, "prompt_tokens", None))
         output_tokens = _as_int(getattr(usage_obj, "completion_tokens", None))
         total_tokens = _as_int(getattr(usage_obj, "total_tokens", None))
@@ -193,7 +202,62 @@ def normalize_usage(
     return u
 
 
-def _find_model_pricing(model: str, pricing_doc: dict[str, Any]) -> Optional[ModelPricing]:
+def _parse_pricing_entry(
+    entry: dict[str, Any],
+    input_tokens: int | None = None,
+) -> Optional[ModelPricing]:
+    """Support either flat pricing or tiered pricing keyed by input token count."""
+    tiers = entry.get("tiers")
+    if isinstance(tiers, list):
+        parsed_tiers: list[PricingTier] = []
+        for tier in tiers:
+            if not isinstance(tier, dict):
+                continue
+            inp = tier.get("input")
+            out = tier.get("output")
+            if inp is None or out is None:
+                continue
+            try:
+                parsed_tiers.append(
+                    PricingTier(
+                        max_input_tokens=_as_int(tier.get("max_input_tokens")),
+                        input_per_1m=float(inp),
+                        output_per_1m=float(out),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+
+        if not parsed_tiers:
+            return None
+
+        if input_tokens is None:
+            selected = parsed_tiers[0]
+        else:
+            selected = parsed_tiers[-1]
+            for tier in parsed_tiers:
+                if tier.max_input_tokens is None or input_tokens <= tier.max_input_tokens:
+                    selected = tier
+                    break
+
+        return ModelPricing(selected.input_per_1m, selected.output_per_1m)
+
+    inp = entry.get("input")
+    out = entry.get("output")
+    if inp is None or out is None:
+        return None
+
+    try:
+        return ModelPricing(float(inp), float(out))
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_model_pricing(
+    model: str,
+    pricing_doc: dict[str, Any],
+    input_tokens: int | None = None,
+) -> Optional[ModelPricing]:
     """
     Pricing lookup rules:
     - exact match under pricing_doc["models"][model]
@@ -213,15 +277,7 @@ def _find_model_pricing(model: str, pricing_doc: dict[str, Any]) -> Optional[Mod
     if not isinstance(entry, dict):
         return None
 
-    inp = entry.get("input")
-    out = entry.get("output")
-    if inp is None or out is None:
-        return None
-
-    try:
-        return ModelPricing(float(inp), float(out))
-    except (TypeError, ValueError):
-        return None
+    return _parse_pricing_entry(entry, input_tokens=input_tokens)
 
 
 def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Optional[float]:
@@ -231,13 +287,14 @@ def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Opt
     model = usage.get("model")
     if not model:
         return None
-    mp = _find_model_pricing(model, pricing_doc)
-    if mp is None:
-        return None
 
     input_tokens = usage.get("input_tokens")
     output_tokens = usage.get("output_tokens")
     if input_tokens is None or output_tokens is None:
+        return None
+
+    mp = _find_model_pricing(model, pricing_doc, input_tokens=input_tokens)
+    if mp is None:
         return None
 
     # Rates are USD per 1M tokens.
