@@ -10,6 +10,8 @@ import json
 import argparse
 import subprocess
 import re
+import tempfile
+import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -31,7 +33,6 @@ from api_client import (
     uses_adaptive_thinking,
     uses_gemini_thinking_level,
     uses_openai_reasoning,
-    thinking_budget_to_effort,
     is_openai_model,
     is_moonshot_model,
     is_openrouter_model,
@@ -41,10 +42,18 @@ from api_client import (
     is_gemini_model,
     is_grok_model,
     is_deepseek_model,
-    get_model_version
+    get_model_version,
+    CACHE_TTLS,
+    DEFAULT_CACHE_TTL
 )
 from conversation import build_convo_a, build_convo_b
-from costing import estimate_cost_usd, format_usd, get_pricing_path, load_pricing_file
+from costing import (
+    estimate_cost_usd,
+    estimate_uncached_cost_usd,
+    format_usd,
+    get_pricing_path,
+    load_pricing_file,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -114,7 +123,7 @@ def get_developer_name(model: str) -> str:
         return "Anthropic"
 
 
-def describe_thinking_config(model: str, thinking_budget: int) -> str:
+def describe_thinking_config(model: str, thinking_budget: int, effort: str | None = None) -> str:
     """Render the effective thinking configuration for transcripts."""
     if not supports_thinking(model):
         return "N/A"
@@ -135,8 +144,9 @@ def describe_thinking_config(model: str, thinking_budget: int) -> str:
     if uses_gemini_thinking_level(model):
         return "thinkingLevel=high (includeThoughts)"
     if uses_adaptive_thinking(model):
-        effort = thinking_budget_to_effort(thinking_budget)
-        return f"adaptive ({effort} effort; mapped from budget {thinking_budget})"
+        return f"adaptive ({effort or 'high'} effort)"
+    if thinking_budget is None or thinking_budget <= 0:
+        return "disabled (budget=0)"
     return str(thinking_budget)
 
 
@@ -149,9 +159,7 @@ def describe_temperature_config(model: str, temperature: float) -> str:
 
 def should_inject_turn_marker(model: str) -> bool:
     """Return whether the runner should append inline turn markers for a model."""
-    # OpenRouter GLM-5 misreads the marker as roleplay/system content and can
-    # echo it back into the visible transcript.
-    return model not in {"openrouter/z-ai/glm-5", "zai/glm-5"}
+    return False
 
 
 def sanitize_turn_marker_echo(model: str, content_blocks: list, response_text: str) -> tuple[list, str]:
@@ -175,7 +183,6 @@ def sanitize_turn_marker_echo(model: str, content_blocks: list, response_text: s
 def run_conversation(
     system_prompt_a: str,
     system_prompt_b: str,
-    start_a: str = "",
     start_b: str = "You are about to speak with another LLM. Please begin the conversation.",
     max_turns: int = 40,
     temperature_a: float = 1.0,
@@ -183,13 +190,22 @@ def run_conversation(
     output_dir: str = "transcripts",
     model_a: str = "claude-sonnet-4-5-20250929",
     model_b: str = "claude-sonnet-4-5-20250929",
-    thinking_budget_a: int = 12000,
-    thinking_budget_b: int = 12000,
+    thinking_budget_a: int | None = None,
+    thinking_budget_b: int | None = None,
+    effort_a: str | None = None,
+    effort_b: str | None = None,
     final_question_a: str = None,
     final_question_b: str = None,
-    pricing_file: str | None = None
+    pricing_file: str | None = None,
+    max_tokens: int | None = None,
+    cache_ttl: str = DEFAULT_CACHE_TTL
 ):
-    """Run a conversation between two models with per-model settings."""
+    """Run a conversation between two models with per-model settings.
+
+    max_tokens is a hard cap on total output (thinking + response text) per turn.
+    Pass None to use each model's default (get_max_tokens); raise it for high/max
+    effort adaptive-thinking runs so thinking doesn't crowd out the visible reply.
+    """
 
     model_a = normalize_model_name(model_a)
     model_b = normalize_model_name(model_b)
@@ -198,7 +214,7 @@ def run_conversation(
         raise ValueError(f"max_turns must be even so turns split evenly between models; got {max_turns}")
 
     run_started_at = datetime.now()
-    run_timestamp = run_started_at.strftime("%Y-%m-%d-%H-%M-%S-%f")
+    run_timestamp = f"{run_started_at.strftime('%Y-%m-%d-%H-%M-%S-%f')}-{uuid.uuid4().hex[:8]}"
 
     # Create API clients only for the providers being used
     needs_anthropic = (
@@ -239,7 +255,7 @@ def run_conversation(
                 f"System: Commencing turn 1 of {max_turns // 2}."
             )
 
-    history_a = [start_a, initial_prompt_a]
+    history_a = [initial_prompt_a]
     history_b = []
     response_b = None
     response_a = None
@@ -281,20 +297,20 @@ def run_conversation(
     transcript_note = """About this transcript:
 - This file contains: (a) the parameters used for the run (b) a transcript of the convervsation, formatted to improve readability.
 - The following has been added to the transcript, but are not seen by the models: this note, the parameter/model sections, section headers, turn separators, [THINKING]/[RESPONSE] labels, the run summary, cost information and any status/error note for incomplete runs.
-- Some models may see turn markers such as "System: Commencing turn 2 of 20.". These are injected into the previous model's response after that response is generated, so they are only seen by the model about to commence its turn. Compatibility-sensitive models may have these markers disabled.
 
 """
 
     # Parameters section
     params_info = f"""Parameters:
 - Max Turns: {max_turns}
+- Max Tokens: {max_tokens if max_tokens is not None else "per-model default"}
+- Cache TTL: {cache_ttl} (Anthropic prompt caching)
 - Temperature A: {describe_temperature_config(model_a, temperature_a)}
 - Temperature B: {describe_temperature_config(model_b, temperature_b)}
-- Thinking A: {describe_thinking_config(model_a, thinking_budget_a)}
-- Thinking B: {describe_thinking_config(model_b, thinking_budget_b)}
+- Thinking A: {describe_thinking_config(model_a, thinking_budget_a, effort_a)}
+- Thinking B: {describe_thinking_config(model_b, thinking_budget_b, effort_b)}
 - Timestamp: {run_started_at.strftime("%Y-%m-%d %H:%M:%S")}
 - Git Commit Hash: {git_commit_hash or "unknown"}
-- Start Message A: {start_a if start_a else "(empty)"}
 - Start Message B: {start_b if start_b else "(empty)"}
 - Final Question A: {final_question_a if final_question_a else "(none)"}
 - Final Question B: {final_question_b if final_question_b else "(none)"}
@@ -333,11 +349,14 @@ System Prompt B: {system_prompt_b}
     run_metrics: list[dict] = []
     run_config = {
         "max_turns": max_turns,
+        "max_tokens": max_tokens,
+        "cache_ttl": cache_ttl,
         "temperature_a": temperature_a,
         "temperature_b": temperature_b,
         "thinking_budget_a": thinking_budget_a,
         "thinking_budget_b": thinking_budget_b,
-        "start_a": start_a,
+        "effort_a": effort_a,
+        "effort_b": effort_b,
         "start_b": start_b,
         "final_question_a": final_question_a,
         "final_question_b": final_question_b,
@@ -391,7 +410,8 @@ System Prompt B: {system_prompt_b}
                 checkpoint(phase=f"awaiting_model_a_turn_{turn_num_a}")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
                     anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_a, system_prompt_a,
-                    temperature_a, model=model_a, thinking_budget=thinking_budget_a,
+                    temperature_a, model=model_a, thinking_budget=thinking_budget_a, effort=effort_a,
+                    max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
@@ -436,7 +456,8 @@ System Prompt B: {system_prompt_b}
                 checkpoint(phase=f"awaiting_model_b_turn_{turn_num_b}")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
                     anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_b, system_prompt_b,
-                    temperature_b, model=model_b, thinking_budget=thinking_budget_b,
+                    temperature_b, model=model_b, thinking_budget=thinking_budget_b, effort=effort_b,
+                    max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
@@ -481,7 +502,8 @@ System Prompt B: {system_prompt_b}
                 checkpoint(phase="awaiting_final_question_a")
                 content_blocks_a, reasoning_a, response_a, usage_a = generate_response(
                     anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_a, system_prompt_a,
-                    temperature_a, model=model_a, thinking_budget=thinking_budget_a,
+                    temperature_a, model=model_a, thinking_budget=thinking_budget_a, effort=effort_a,
+                    max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
@@ -519,7 +541,8 @@ System Prompt B: {system_prompt_b}
                 checkpoint(phase="awaiting_final_question_b")
                 content_blocks_b, reasoning_b, response_b, usage_b = generate_response(
                     anthropic_client, openai_client, moonshot_client, openrouter_client, zai_client, qwen_client, glm_client, convo_b, system_prompt_b,
-                    temperature_b, model=model_b, thinking_budget=thinking_budget_b,
+                    temperature_b, model=model_b, thinking_budget=thinking_budget_b, effort=effort_b,
+                    max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
                 content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
@@ -592,26 +615,52 @@ def _format_usage_lines(usage: dict, est_cost_usd: float | None) -> str:
 
 def _format_run_summary(run_metrics: list[dict], pricing_doc: dict) -> str:
     # Aggregate by who (A/B) and overall.
-    agg: dict[str, dict[str, float | int]] = {}
+    agg: dict[str, dict[str, float | int | bool]] = {}
     total_cost = 0.0
+    total_baseline = 0.0
     total_cost_known = False
+    any_cache_seen = False
 
     for m in run_metrics:
         who = m.get("who", "?")
         usage = m.get("usage") or {}
         inp = usage.get("input_tokens") or 0
         out = usage.get("output_tokens") or 0
+        cache_read = usage.get("cache_read_tokens") or 0
+        cache_creation = usage.get("cache_creation_tokens") or 0
         cost = m.get("cost_usd")
+        baseline = estimate_uncached_cost_usd(usage, pricing_doc)
 
-        a = agg.setdefault(who, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "cost_known": False})
+        if cache_read or cache_creation:
+            any_cache_seen = True
+
+        a = agg.setdefault(
+            who,
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cost_usd": 0.0,
+                "baseline_usd": 0.0,
+                "cost_known": False,
+            },
+        )
         a["input_tokens"] = int(a["input_tokens"]) + int(inp)
         a["output_tokens"] = int(a["output_tokens"]) + int(out)
+        a["thinking_tokens"] = int(a["thinking_tokens"]) + int(usage.get("thinking_tokens") or 0)
+        a["cache_read_tokens"] = int(a["cache_read_tokens"]) + int(cache_read)
+        a["cache_creation_tokens"] = int(a["cache_creation_tokens"]) + int(cache_creation)
 
         if cost is not None:
             a["cost_usd"] = float(a["cost_usd"]) + float(cost)
             a["cost_known"] = True
             total_cost += float(cost)
             total_cost_known = True
+        if baseline is not None:
+            a["baseline_usd"] = float(a["baseline_usd"]) + float(baseline)
+            total_baseline += float(baseline)
 
     lines = []
     lines.append("\n" + "=" * 80)
@@ -623,12 +672,52 @@ def _format_run_summary(run_metrics: list[dict], pricing_doc: dict) -> str:
         if not a:
             continue
         cost_str = format_usd(a["cost_usd"] if a.get("cost_known") else None)
-        lines.append(
-            f"- Model {who}: input_tokens={a['input_tokens']} output_tokens={a['output_tokens']} estimated_cost={cost_str}"
-        )
+        cache_read = int(a["cache_read_tokens"])
+        cache_creation = int(a["cache_creation_tokens"])
+
+        if any_cache_seen:
+            # Provider semantics differ for what "cacheable input" means, so
+            # report the cache columns as raw counts plus a hit-ratio against
+            # the total input-equivalent for this side.
+            total_input_equiv = int(a["input_tokens"]) + cache_read + cache_creation
+            hit_ratio = (cache_read / total_input_equiv * 100.0) if total_input_equiv else 0.0
+            baseline = float(a["baseline_usd"])
+            saved = baseline - float(a["cost_usd"]) if a.get("cost_known") else None
+            cache_part = f" cache_read={cache_read} cache_write={cache_creation} hit={hit_ratio:.0f}%"
+            saved_part = (
+                f" baseline={format_usd(baseline)} saved={format_usd(saved)}"
+                if a.get("cost_known")
+                else ""
+            )
+            think_part = (
+                f" thinking={int(a['thinking_tokens'])}"
+                if int(a.get("thinking_tokens") or 0) > 0
+                else ""
+            )
+            lines.append(
+                f"- Model {who}: input={a['input_tokens']} output={a['output_tokens']}{think_part}"
+                f"{cache_part} cost={cost_str}{saved_part}"
+            )
+        else:
+            think_part = (
+                f" thinking_tokens={int(a['thinking_tokens'])}"
+                if int(a.get("thinking_tokens") or 0) > 0
+                else ""
+            )
+            lines.append(
+                f"- Model {who}: input_tokens={a['input_tokens']} output_tokens={a['output_tokens']}{think_part} estimated_cost={cost_str}"
+            )
 
     total_str = format_usd(total_cost if total_cost_known else None)
-    lines.append(f"- TOTAL: estimated_cost={total_str}")
+    if any_cache_seen and total_cost_known and total_baseline > 0:
+        saved = total_baseline - total_cost
+        pct = (saved / total_baseline * 100.0) if total_baseline else 0.0
+        lines.append(
+            f"- TOTAL: cost={total_str} baseline={format_usd(total_baseline)} "
+            f"saved={format_usd(saved)} ({pct:.1f}%)"
+        )
+    else:
+        lines.append(f"- TOTAL: estimated_cost={total_str}")
     lines.append("=" * 80 + "\n")
     return "\n".join(lines)
 
@@ -699,17 +788,33 @@ def _render_transcript_document(
 
 
 def _write_text_atomic(path: str, content: str):
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as file:
+    temp_dir = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=temp_dir,
+        prefix=f"{os.path.basename(path)}.",
+        suffix=".tmp",
+        delete=False,
+    ) as file:
         file.write(content)
+        temp_path = file.name
     os.replace(temp_path, path)
 
 
 def _write_json_atomic(path: str, payload: dict):
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as file:
+    temp_dir = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=temp_dir,
+        prefix=f"{os.path.basename(path)}.",
+        suffix=".tmp",
+        delete=False,
+    ) as file:
         json.dump(payload, file, indent=2, ensure_ascii=False)
         file.write("\n")
+        temp_path = file.name
     os.replace(temp_path, path)
 
 
@@ -808,6 +913,24 @@ def save_transcript(
     return save_path, state_path
 
 
+def _resolve_thinking(model: str, slot_effort: str | None, slot_budget: int | None) -> tuple[str | None, int | None]:
+    """
+    Resolve final effort and thinking_budget for a model.
+
+    Resolution order (highest priority first):
+      1. Explicit CLI arg / non-None slot override in params.py
+      2. MODEL_DEFAULTS[model] in params.py
+      3. Global fallback (_MODEL_DEFAULTS_FALLBACK)
+
+    Adaptive models return effort only (thinking_budget is None).
+    Fixed-budget models return thinking_budget only (effort is None/empty).
+    """
+    defaults = params.get_model_thinking_defaults(model)
+    effort = slot_effort if slot_effort is not None else defaults.get("effort")
+    budget = slot_budget if slot_budget is not None else defaults.get("thinking_budget")
+    return effort, budget
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run a conversation between two Claude instances",
@@ -815,9 +938,13 @@ if __name__ == "__main__":
         epilog="""
 Available models:
   Anthropic (with thinking support):
+    - claude-opus-4-8
+    - claude-opus-4-7
+    - claude-opus-4-6
     - claude-opus-4-5-20251101
+    - claude-sonnet-4-6
     - claude-haiku-4-5-20251001
-    - claude-sonnet-4-5-20250929 (default)
+    - claude-sonnet-4-5-20250929
     - claude-opus-4-1-20250805
     - claude-opus-4-20250514
     - claude-sonnet-4-20250514
@@ -828,12 +955,16 @@ Available models:
     - claude-3-haiku-20240307
 
   xAI Grok (with reasoning):
+    - grok-4.3
     - grok-4-1-fast-reasoning
     - grok-4-1-reasoning
     - grok-4-1
 
   OpenAI:
     - gpt-5 / gpt-5.x (Responses API, default medium reasoning)
+    - gpt-5.5
+    - gpt-5.5-pro
+    - gpt-5.6-sol
     - gpt-5.2-2025-12-11
     - chatgpt-4o-latest
     - gpt-5-chat-latest
@@ -841,11 +972,11 @@ Available models:
     - gpt-4-turbo
 
 Examples:
-  # Use default models (both Claude Sonnet 4.5)
+  # Use the default models from params.py
   python3 main.py
 
-  # Claude Opus 4.5 vs OpenAI GPT-5.2
-  python3 main.py --model-a claude-opus-4-5-20251101 --model-b gpt-5.2-2025-12-11
+  # Claude Opus 4.7 vs OpenAI GPT-5.5
+  python3 main.py --model-a claude-opus-4-7 --model-b gpt-5.5
 
   # OpenAI vs OpenAI
   python3 main.py --model-a chatgpt-4o-latest --model-b gpt-5-chat-latest
@@ -894,14 +1025,30 @@ Examples:
         "--thinking-budget-a",
         type=int,
         default=params.THINKING_BUDGET_A,
-        help=f"Thinking budget for Model A (default: {params.THINKING_BUDGET_A})"
+        help="Thinking budget for Model A (default: from MODEL_DEFAULTS in params.py)"
     )
 
     parser.add_argument(
         "--thinking-budget-b",
         type=int,
         default=params.THINKING_BUDGET_B,
-        help=f"Thinking budget for Model B (default: {params.THINKING_BUDGET_B})"
+        help="Thinking budget for Model B (default: from MODEL_DEFAULTS in params.py)"
+    )
+
+    parser.add_argument(
+        "--effort-a",
+        type=str,
+        choices=["", "low", "medium", "high", "xhigh", "max"],
+        default=params.EFFORT_A,
+        help="Anthropic adaptive-thinking effort for Model A; \"\" falls back to the budget mapping (default: from MODEL_DEFAULTS in params.py)"
+    )
+
+    parser.add_argument(
+        "--effort-b",
+        type=str,
+        choices=["", "low", "medium", "high", "xhigh", "max"],
+        default=params.EFFORT_B,
+        help="Anthropic adaptive-thinking effort for Model B; \"\" falls back to the budget mapping (default: from MODEL_DEFAULTS in params.py)"
     )
 
     parser.add_argument(
@@ -925,6 +1072,24 @@ Examples:
         help="Optional JSON pricing file (USD per 1M tokens) to estimate cost (default: pricing.json if present, or env PRICING_FILE)"
     )
 
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Hard cap on output tokens per turn (thinking + response). Applies to both models. "
+             "Default: each model's built-in limit (16000 for most). Raise to ~64000 for xhigh/max effort."
+    )
+
+    parser.add_argument(
+        "--cache-ttl",
+        type=str,
+        choices=list(CACHE_TTLS),
+        default=DEFAULT_CACHE_TTL,
+        help=f"Anthropic prompt-cache TTL (default: {DEFAULT_CACHE_TTL}). Use 1h for high/max effort runs "
+             "where a slow peer turn can exceed the 5m window and expire the prefix before it's re-read; "
+             "5m is cheaper on writes (1.25x vs 2x) for fast-cadence runs."
+    )
+
     args = parser.parse_args()
 
     if args.turns % 2 != 0:
@@ -934,6 +1099,9 @@ Examples:
     actual_turns_per_model = args.turns // 2
     model_a = normalize_model_name(args.model_a)
     model_b = normalize_model_name(args.model_b)
+
+    effort_a, thinking_budget_a = _resolve_thinking(model_a, args.effort_a, args.thinking_budget_a)
+    effort_b, thinking_budget_b = _resolve_thinking(model_b, args.effort_b, args.thinking_budget_b)
 
     # Create system prompts for each model using separate prompts from params
     system_prompt_a = params.SYSTEM_PROMPT_A.format(
@@ -971,7 +1139,6 @@ Examples:
     run_conversation(
         system_prompt_a=system_prompt_a,
         system_prompt_b=system_prompt_b,
-        start_a=params.START_MESSAGE_A,
         start_b=params.START_MESSAGE_B,
         max_turns=args.turns,
         temperature_a=args.temperature_a,
@@ -979,9 +1146,13 @@ Examples:
         output_dir=params.OUTPUT_DIR,
         model_a=model_a,
         model_b=model_b,
-        thinking_budget_a=args.thinking_budget_a,
-        thinking_budget_b=args.thinking_budget_b,
+        thinking_budget_a=thinking_budget_a,
+        thinking_budget_b=thinking_budget_b,
+        effort_a=effort_a,
+        effort_b=effort_b,
         final_question_a=final_question_a,
         final_question_b=final_question_b,
-        pricing_file=args.pricing_file
+        pricing_file=args.pricing_file,
+        max_tokens=args.max_tokens,
+        cache_ttl=args.cache_ttl
     )

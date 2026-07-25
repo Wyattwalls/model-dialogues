@@ -31,6 +31,8 @@ from typing import Any, Optional
 class ModelPricing:
     input_per_1m: float
     output_per_1m: float
+    cache_read_per_1m: float | None = None
+    cache_write_per_1m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class PricingTier:
     max_input_tokens: int | None
     input_per_1m: float
     output_per_1m: float
+    cache_read_per_1m: float | None = None
+    cache_write_per_1m: float | None = None
 
 
 def load_pricing_file(path: Optional[str]) -> dict[str, Any]:
@@ -93,24 +97,43 @@ def normalize_usage(
     if provider == "anthropic":
         input_tokens = _as_int(getattr(usage_obj, "input_tokens", None))
         output_tokens = _as_int(getattr(usage_obj, "output_tokens", None))
-        # Some Anthropic SDK versions also provide cache read/write tokens.
-        for k in [
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_tokens",
-            "cache_read_tokens",
-        ]:
-            v = getattr(usage_obj, k, None)
-            if v is not None:
-                details[k] = v
+        # Anthropic reports cache reads and writes separately from input_tokens
+        # (input_tokens is the uncached portion only).
+        cache_read = _as_int(getattr(usage_obj, "cache_read_input_tokens", None))
+        cache_creation = _as_int(getattr(usage_obj, "cache_creation_input_tokens", None))
+        if cache_read is not None:
+            details["cache_read_input_tokens"] = cache_read
+        if cache_creation is not None:
+            details["cache_creation_input_tokens"] = cache_creation
+        # output_tokens_details.thinking_tokens reports the full thinking tokens
+        # billed for adaptive/extended thinking, even when display="omitted"
+        # makes the thinking content invisible in the response. Capturing it
+        # lets us report what we paid for thinking vs visible response text.
+        # The SDK may expose this as either an attribute or a dict.
+        thinking_tokens = None
+        out_details = getattr(usage_obj, "output_tokens_details", None)
+        if out_details is not None:
+            if isinstance(out_details, dict):
+                thinking_tokens = _as_int(out_details.get("thinking_tokens"))
+            else:
+                thinking_tokens = _as_int(getattr(out_details, "thinking_tokens", None))
+        if thinking_tokens is not None:
+            details["thinking_tokens"] = thinking_tokens
         total_tokens = None
         if input_tokens is not None and output_tokens is not None:
             total_tokens = input_tokens + output_tokens
+            if cache_read is not None:
+                total_tokens += cache_read
+            if cache_creation is not None:
+                total_tokens += cache_creation
         u.update(
             {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_creation,
+                "thinking_tokens": thinking_tokens,
                 "details": details or None,
             }
         )
@@ -130,18 +153,44 @@ def normalize_usage(
         if total_tokens is None:
             total_tokens = _as_int(getattr(usage_obj, "total_tokens", None))
 
-        # Details might include reasoning tokens; keep if present.
+        # Details might include reasoning tokens; keep if present. Responses API
+        # usage uses output_tokens_details, while Chat Completions uses
+        # completion_tokens_details.
         output_details = getattr(usage_obj, "completion_tokens_details", None)
+        if output_details is None:
+            output_details = getattr(usage_obj, "output_tokens_details", None)
         if output_details is not None and hasattr(output_details, "__dict__"):
             details["completion_tokens_details"] = dict(output_details.__dict__)
         reasoning_tokens = _as_int(getattr(usage_obj, "reasoning_tokens", None))
+        if reasoning_tokens is None and output_details is not None:
+            reasoning_tokens = _as_int(getattr(output_details, "reasoning_tokens", None))
         if reasoning_tokens is not None:
             details["reasoning_tokens"] = reasoning_tokens
+
+        # Cache hits are a subset of prompt_tokens for OpenAI-compatible APIs.
+        # Responses API uses input_tokens_details; Chat Completions uses
+        # prompt_tokens_details. Other compatible providers may use top-level
+        # prompt_cache_hit_tokens.
+        cache_read = None
+        prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
+        if prompt_details is None:
+            prompt_details = getattr(usage_obj, "input_tokens_details", None)
+        if prompt_details is not None:
+            cache_read = _as_int(getattr(prompt_details, "cached_tokens", None))
+            if hasattr(prompt_details, "__dict__"):
+                details["prompt_tokens_details"] = dict(prompt_details.__dict__)
+        if cache_read is None:
+            # DeepSeek (and some OpenAI-compatible providers) report it top-level.
+            cache_read = _as_int(getattr(usage_obj, "prompt_cache_hit_tokens", None))
+        if cache_read is not None:
+            details["cached_tokens"] = cache_read
+
         u.update(
             {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "cache_read_tokens": cache_read,
                 "details": details or None,
             }
         )
@@ -152,15 +201,25 @@ def normalize_usage(
         output_tokens = _as_int(getattr(usage_obj, "candidates_token_count", None))
         total_tokens = _as_int(getattr(usage_obj, "total_token_count", None))
         thoughts_tokens = _as_int(getattr(usage_obj, "thoughts_token_count", None))
+        cache_read = _as_int(getattr(usage_obj, "cached_content_token_count", None))
 
         if thoughts_tokens is not None:
             details["thoughts_token_count"] = thoughts_tokens
+            # Google bills thinking tokens at the output rate but exposes them
+            # as a separate count; fold them into output for correct billing.
+            if output_tokens is not None:
+                details["visible_output_tokens"] = output_tokens
+                output_tokens = output_tokens + thoughts_tokens
+
+        if cache_read is not None:
+            details["cached_content_token_count"] = cache_read
 
         u.update(
             {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "cache_read_tokens": cache_read,
                 "details": details or None,
             }
         )
@@ -202,6 +261,15 @@ def normalize_usage(
     return u
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_pricing_entry(
     entry: dict[str, Any],
     input_tokens: int | None = None,
@@ -223,6 +291,8 @@ def _parse_pricing_entry(
                         max_input_tokens=_as_int(tier.get("max_input_tokens")),
                         input_per_1m=float(inp),
                         output_per_1m=float(out),
+                        cache_read_per_1m=_optional_float(tier.get("cache_read")),
+                        cache_write_per_1m=_optional_float(tier.get("cache_write")),
                     )
                 )
             except (TypeError, ValueError):
@@ -240,7 +310,12 @@ def _parse_pricing_entry(
                     selected = tier
                     break
 
-        return ModelPricing(selected.input_per_1m, selected.output_per_1m)
+        return ModelPricing(
+            selected.input_per_1m,
+            selected.output_per_1m,
+            cache_read_per_1m=selected.cache_read_per_1m,
+            cache_write_per_1m=selected.cache_write_per_1m,
+        )
 
     inp = entry.get("input")
     out = entry.get("output")
@@ -248,7 +323,12 @@ def _parse_pricing_entry(
         return None
 
     try:
-        return ModelPricing(float(inp), float(out))
+        return ModelPricing(
+            float(inp),
+            float(out),
+            cache_read_per_1m=_optional_float(entry.get("cache_read")),
+            cache_write_per_1m=_optional_float(entry.get("cache_write")),
+        )
     except (TypeError, ValueError):
         return None
 
@@ -283,6 +363,15 @@ def _find_model_pricing(
 def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Optional[float]:
     """
     Returns estimated USD cost for one request, or None if not computable.
+
+    Applies cache discounts when pricing_doc supplies cache_read / cache_write
+    rates and the usage carries cache_read_tokens / cache_creation_tokens.
+
+    Provider semantics differ:
+    - Anthropic: input_tokens is the uncached portion only; cache reads and
+      writes are billed in addition.
+    - OpenAI / Gemini / DeepSeek: cache_read_tokens are a subset of
+      input_tokens. The uncached portion = input_tokens - cache_read_tokens.
     """
     model = usage.get("model")
     if not model:
@@ -297,8 +386,65 @@ def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Opt
     if mp is None:
         return None
 
-    # Rates are USD per 1M tokens.
-    return (input_tokens * mp.input_per_1m + output_tokens * mp.output_per_1m) / 1_000_000.0
+    provider = usage.get("provider")
+    cache_read = usage.get("cache_read_tokens") or 0
+    cache_creation = usage.get("cache_creation_tokens") or 0
+
+    # When a specific cache rate is missing, fall back to the input rate
+    # (slightly over-bills cached reads, slightly under-bills Anthropic writes;
+    # accurate again once the user backfills rates in pricing.json).
+    cache_read_rate = mp.cache_read_per_1m if mp.cache_read_per_1m is not None else mp.input_per_1m
+    cache_write_rate = mp.cache_write_per_1m if mp.cache_write_per_1m is not None else mp.input_per_1m
+
+    if provider == "anthropic":
+        cost = (
+            input_tokens * mp.input_per_1m
+            + cache_read * cache_read_rate
+            + cache_creation * cache_write_rate
+            + output_tokens * mp.output_per_1m
+        )
+    else:
+        uncached_input = max(0, input_tokens - cache_read)
+        cost = (
+            uncached_input * mp.input_per_1m
+            + cache_read * cache_read_rate
+            + output_tokens * mp.output_per_1m
+        )
+
+    return cost / 1_000_000.0
+
+
+def estimate_uncached_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Optional[float]:
+    """
+    What this request would have cost with no caching at all.
+
+    Used to compute savings vs the no-cache baseline. Same semantics caveat as
+    estimate_cost_usd: Anthropic's input_tokens excludes cache reads/writes,
+    while OpenAI/Gemini include them.
+    """
+    model = usage.get("model")
+    if not model:
+        return None
+
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if input_tokens is None or output_tokens is None:
+        return None
+
+    mp = _find_model_pricing(model, pricing_doc, input_tokens=input_tokens)
+    if mp is None:
+        return None
+
+    provider = usage.get("provider")
+    cache_read = usage.get("cache_read_tokens") or 0
+    cache_creation = usage.get("cache_creation_tokens") or 0
+
+    if provider == "anthropic":
+        total_input = input_tokens + cache_read + cache_creation
+    else:
+        total_input = input_tokens  # cache_read already a subset
+
+    return (total_input * mp.input_per_1m + output_tokens * mp.output_per_1m) / 1_000_000.0
 
 
 def format_usd(amount: Optional[float]) -> str:

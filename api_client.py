@@ -10,11 +10,35 @@ import anthropic
 import openai
 from google import genai
 from xai_sdk import Client as XAIClient
-from xai_sdk.chat import user as xai_user, system as xai_system
+from xai_sdk.chat import assistant as xai_assistant, user as xai_user, system as xai_system
 
 from costing import normalize_usage
 
+# Valid Anthropic cache TTLs. "5m" is the API default; "1h" is GA (no beta
+# header) and costs 2x base input on writes vs 1.25x for "5m", but reads are
+# 0.1x for both. Use "1h" when the gap between a model's consecutive turns can
+# exceed 5 minutes (e.g. high/max effort runs, where a single peer turn can take
+# longer than the 5m window and expire the prefix before it is ever re-read).
+CACHE_TTLS = ("5m", "1h")
+DEFAULT_CACHE_TTL = "1h"
+
 MODEL_ALIASES = {
+    # Convenience aliases for the current Opus API ids.
+    # Claude Opus 5 — fixed id with no date suffix (GA July 2026).
+    "opus-5": "claude-opus-5",
+    "claude-opus5": "claude-opus-5",
+    "claude-opus-4.8": "claude-opus-4-8",
+    "claude-opus-4.7": "claude-opus-4-7",
+    # Claude Fable 5 — Anthropic's highest-tier widely-available model (GA June 2026).
+    "fable-5": "claude-fable-5",
+    "fable": "claude-fable-5",
+    # Claude Mythos 5
+    "mythos-5": "claude-mythos-5",
+    "mythos": "claude-mythos-5",
+    # ChatGPT "GPT-5.5 Instant" is exposed in the API as the floating `chat-latest`
+    # alias (which currently points at gpt-5.5 instant). Map several friendly forms.
+    "gpt-5.5-instant": "chat-latest",
+    "gpt-5.5-chat-latest": "chat-latest",
     # ChatGPT "GPT-5.2 Instant" maps to the public API chat-latest model id.
     "gpt-5.2-instant": "gpt-5.2-chat-latest",
     # Accept either Moonshot naming style for Kimi K2.5.
@@ -27,6 +51,13 @@ MODEL_ALIASES = {
     "zai/glm-5": "zai/glm-5",
     # Allow a separator-free shorthand for the exact Qwen 3.5 MoE model.
     "qwen3.5-397ba17b": "qwen3.5-397b-a17b",
+    # Current xAI model ids no longer include the older beta infix.
+    "grok-4.20-beta-0309-reasoning": "grok-4.20-0309-reasoning",
+    "grok-4.20-beta-0309-non-reasoning": "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent": "grok-4.20-multi-agent-0309",
+    "grok-4.20-multi-agent-beta-0309": "grok-4.20-multi-agent-0309",
+    "grok-4.3-latest": "grok-4.3",
+    "grok-43": "grok-4.3",
 }
 
 # Maps API model IDs to the known underlying model version for transcript metadata.
@@ -36,12 +67,22 @@ MODEL_VERSIONS = {
     "deepseek-chat": "DeepSeek-V3.2",
     "chatgpt-4o-latest": "GPT-4o (latest snapshot)",
     "gpt-5-chat-latest": "GPT-5 (chat-latest snapshot)",
+    "gpt-5.5": "GPT-5.5",
+    "gpt-5.5-pro": "GPT-5.5 Pro",
+    "gpt-5.6-sol": "GPT-5.6 SOL",
     "gpt-5.2-chat-latest": "GPT-5.2 (chat-latest snapshot)",
+    "chat-latest": "GPT-5.5 Instant (chat-latest floating alias)",
+    "grok-4.3": "Grok 4.3",
+    "grok-4.20-0309-reasoning": "Grok 4.20 (0309 reasoning snapshot)",
+    "grok-4.20-0309-non-reasoning": "Grok 4.20 (0309 non-reasoning snapshot)",
+    "grok-4.20-multi-agent-0309": "Grok 4.20 multi-agent (0309 snapshot)",
     "qwen3.5-397b-a17b": "Qwen3.5 397B A17B",
     "glm-5": "GLM-5",
     "openrouter/moonshotai/kimi-k2.5": "Kimi K2.5",
     "openrouter/z-ai/glm-5": "GLM-5",
     "zai/glm-5": "GLM-5",
+    "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
+    "gemini-3.5-flash": "Gemini 3.5 Flash",
 }
 
 
@@ -50,8 +91,13 @@ def get_model_version(model: str) -> str | None:
     return MODEL_VERSIONS.get(model)
 
 
-# Anthropic models that support extended thinking
+# Anthropic models that support fixed-budget or adaptive thinking.
 THINKING_MODELS = {
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-5-20251101",
@@ -63,16 +109,42 @@ THINKING_MODELS = {
     "claude-3-7-sonnet-20250219",
 }
 
-# Anthropic models that use adaptive thinking instead of fixed budget_tokens.
+# Anthropic models that use adaptive thinking (thinking: {type: "adaptive"}).
+# These models never use budget_tokens.
 ADAPTIVE_THINKING_MODELS = {
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
     "claude-opus-4-6",
+    "claude-sonnet-4-6",
 }
+
+# Adaptive-thinking models that reject temperature/sampling params entirely
+# and support the "xhigh" (and "max") effort level.
+XHIGH_EFFORT_MODELS = {
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+}
+
+
+def supports_xhigh_effort(model: str) -> bool:
+    """Return True if the model accepts the xhigh adaptive-thinking effort."""
+    return model in XHIGH_EFFORT_MODELS
 
 # OpenAI models
 OPENAI_MODELS = {
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.6-sol",
     "gpt-5.2-2025-12-11",
     "chatgpt-4o-latest",
     "gpt-5-chat-latest",
+    "chat-latest",  # GPT-5.5 Instant — floating alias for current ChatGPT default
     "gpt-4o",
     "gpt-4-turbo",
     "gpt-4",
@@ -116,7 +188,10 @@ ZAI_THINKING_MODELS = {
 
 # xAI Grok models that support reasoning/thinking
 GROK_THINKING_MODELS = {
+    "grok-4.3",
     "grok-4.20-beta-0309-reasoning",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-multi-agent-0309",
     "grok-4-fast-reasoning",
     "grok-4-1-fast-reasoning",
     "grok-4-1-reasoning",
@@ -127,6 +202,7 @@ GROK_THINKING_MODELS = {
 # Known xAI Grok models that are explicitly non-reasoning.
 GROK_NON_REASONING_MODELS = {
     "grok-4.20-beta-0309-non-reasoning",
+    "grok-4.20-0309-non-reasoning",
     "grok-4-fast-non-reasoning",
     "grok-4-1-fast-non-reasoning",
 }
@@ -173,6 +249,7 @@ MODEL_MAX_TOKENS = {
     "claude-3-opus-20240229": 4096,
     "claude-3-5-haiku-20241022": 8192,
     "claude-3-haiku-20240307": 4096,
+    "gpt-4o-2024-05-13": 4096,
 }
 
 
@@ -401,7 +478,7 @@ def uses_openai_reasoning(model: str) -> bool:
 
 
 def supports_thinking(model: str) -> bool:
-    """Check if a model supports extended thinking."""
+    """Check if a model supports provider-side thinking/reasoning."""
     if model in GROK_NON_REASONING_MODELS:
         return False
     return (
@@ -428,13 +505,29 @@ def uses_gemini_thinking_level(model: str) -> bool:
     return model.startswith("gemini-3")
 
 
-def thinking_budget_to_effort(thinking_budget: int) -> str:
-    """Map the existing budget control onto Anthropic's adaptive effort levels."""
+def thinking_budget_to_effort(thinking_budget: int, model: str | None = None) -> str:
+    """
+    Map the integer budget control onto Anthropic's adaptive effort levels.
+
+    Per Anthropic's Effort docs the full ladder for adaptive thinking is:
+        low -> medium -> high -> xhigh -> max
+    where `xhigh` is available on Opus 4.7, 4.8, and Opus 5. For models that
+    don't accept xhigh (e.g. Opus 4.6), the xhigh tier collapses to `high`
+    rather than `max` — Anthropic explicitly warns max can over-think and waste
+    tokens on workloads that aren't genuinely frontier.
+
+    The budget thresholds are this repo's convention, not Anthropic's; effort
+    is a behavioral signal, not a token quota.
+    """
     if thinking_budget <= 1024:
         return "low"
     if thinking_budget <= 4096:
         return "medium"
     if thinking_budget <= 12000:
+        return "high"
+    if thinking_budget <= 32000:
+        if model is None or supports_xhigh_effort(model):
+            return "xhigh"
         return "high"
     return "max"
 
@@ -442,6 +535,13 @@ def thinking_budget_to_effort(thinking_budget: int) -> str:
 def get_max_tokens(model: str, default: int = 16000) -> int:
     """Get the maximum tokens allowed for a model."""
     return MODEL_MAX_TOKENS.get(model, default)
+
+
+def _ensure_nonempty_text_response(response_text: str) -> str:
+    """Normalize empty or effectively empty model replies to a safe placeholder."""
+    if response_text and response_text.strip() not in {"", ".", "...", "*", "-", "[silence]"}:
+        return response_text
+    return "*silence*"
 
 
 def generate_response(
@@ -457,10 +557,12 @@ def generate_response(
     temperature: float = 1.0,
     model: str = "claude-sonnet-4-5-20250929",
     max_tokens: int = None,
-    thinking_budget: int = 10000,
+    thinking_budget: int | None = None,
+    effort: str | None = None,
     gemini_client = None,
     xai_client = None,
-    deepseek_client = None
+    deepseek_client = None,
+    cache_ttl: str = DEFAULT_CACHE_TTL
 ) -> tuple[list, str, str, dict]:
     """
     Generate a response using Anthropic, OpenAI, Gemini, or xAI Grok models.
@@ -511,13 +613,65 @@ def generate_response(
         )
     elif is_openai_model(model):
         return _generate_openai_response(
-            openai_client, conversation, system_prompt, temperature, model, max_tokens, thinking_budget
+            openai_client, conversation, system_prompt, temperature, model, max_tokens, thinking_budget, effort
         )
     else:
         return _generate_anthropic_response(
             anthropic_client, conversation, system_prompt, temperature,
-            model, max_tokens, thinking_budget
+            model, max_tokens, thinking_budget, effort, cache_ttl=cache_ttl
         )
+
+
+def _cache_control(ttl: str) -> dict:
+    """Build a cache_control block. '5m' omits ttl (the API default)."""
+    control = {"type": "ephemeral"}
+    if ttl and ttl != "5m":
+        control["ttl"] = ttl
+    return control
+
+
+def _apply_anthropic_cache_breakpoints(
+    system_prompt: str,
+    conversation: list,
+    ttl: str = DEFAULT_CACHE_TTL,
+) -> tuple:
+    """
+    Attach cache_control breakpoints so Anthropic prompt caching covers the
+    (stable) system prompt and the rolling conversation prefix.
+
+    Anthropic caches the longest exact prefix ending at a cache_control marker
+    that exceeds the model's minimum cacheable size. Tagging the last user
+    message creates a checkpoint each turn re-uses on the next — but only if the
+    checkpoint is still live when the next same-model turn starts. Slow (high/max
+    effort) turns can exceed the 5m default TTL, so `ttl` defaults to "1h": with
+    5m, every turn misses and re-writes the whole prefix (strictly worse than no
+    cache). See CACHE_TTLS for the cost trade-off.
+    """
+    control = _cache_control(ttl)
+
+    if system_prompt:
+        system_param = [
+            {"type": "text", "text": system_prompt, "cache_control": control}
+        ]
+    else:
+        system_param = system_prompt
+
+    if not conversation:
+        return system_param, conversation
+
+    last = conversation[-1]
+    last_content = last.get("content")
+    if isinstance(last_content, str):
+        new_content = [
+            {"type": "text", "text": last_content, "cache_control": control}
+        ]
+        messages_param = list(conversation[:-1]) + [{**last, "content": new_content}]
+    else:
+        # Unexpected shape (last message not a plain string); skip the message
+        # breakpoint rather than risk mutating SDK content blocks.
+        messages_param = conversation
+
+    return system_param, messages_param
 
 
 def _generate_anthropic_response(
@@ -527,32 +681,62 @@ def _generate_anthropic_response(
     temperature: float,
     model: str,
     max_tokens: int,
-    thinking_budget: int
+    thinking_budget: int | None,
+    effort: str | None = None,
+    cache_ttl: str = DEFAULT_CACHE_TTL
 ) -> tuple[list, str, str, dict]:
     """Generate response using Anthropic API."""
-    use_thinking = supports_thinking(model) and thinking_budget > 0
+    if uses_adaptive_thinking(model):
+        use_thinking = True
+    else:
+        use_thinking = supports_thinking(model) and thinking_budget is not None and thinking_budget > 0
+
+    system_param, messages_param = _apply_anthropic_cache_breakpoints(
+        system_prompt, conversation, ttl=cache_ttl
+    )
 
     api_params = {
         "model": model,
-        "system": system_prompt,
+        "system": system_param,
         "max_tokens": max_tokens,
-        "messages": conversation,
+        "messages": messages_param,
         "temperature": temperature,
     }
 
     if use_thinking:
         if uses_adaptive_thinking(model):
+            # Opus 4.7, 4.8, and Opus 5 silently default thinking.display to
+            # "omitted", which makes thinking tokens invisible (still billed).
+            # We always want the summary in the transcript, so opt into
+            # "summarized" explicitly. (On Opus 4.6 / Sonnet 4.6 "summarized" is
+            # already the default, so setting it doesn't change behavior there.)
             api_params["thinking"] = {
                 "type": "adaptive",
+                "display": "summarized",
             }
             api_params["output_config"] = {
-                "effort": thinking_budget_to_effort(thinking_budget)
+                "effort": effort or "high"
             }
+            # Fable 5, Opus 4.7, 4.8, and Opus 5 remove temperature/sampling params
+            # entirely (sending temperature returns 400). Opus 4.6 still accepts temperature=1.0.
+            if model in XHIGH_EFFORT_MODELS:
+                del api_params["temperature"]
+            else:
+                api_params["temperature"] = 1.0
         else:
+            # Fixed-budget thinking requires temperature=1.0; the API rejects any
+            # other value, so override whatever was requested once thinking is on.
+            api_params["temperature"] = 1.0
             api_params["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_budget
             }
+
+    # The Anthropic SDK's typed `final_message.usage` model strips
+    # `output_tokens_details` (which carries `thinking_tokens`). The raw
+    # `message_delta` event in the stream still has it, so capture it here and
+    # patch it back onto the normalized usage below.
+    captured_output_token_details: dict | None = None
 
     with client.messages.stream(**api_params) as stream:
         for event in stream:
@@ -562,11 +746,32 @@ def _generate_anthropic_response(
                         print(event.delta.thinking, end="", flush=True)
                     elif event.delta.type == "text_delta":
                         print(event.delta.text, end="", flush=True)
+            elif event.type == "message_delta":
+                evt_usage = getattr(event, "usage", None)
+                if evt_usage is not None and hasattr(evt_usage, "model_dump"):
+                    dumped = evt_usage.model_dump()
+                    otd = dumped.get("output_tokens_details") if isinstance(dumped, dict) else None
+                    if isinstance(otd, dict):
+                        captured_output_token_details = otd
 
         # Stream may be closed on context exit; get the final message while still inside.
         final_message = stream.get_final_message()
     content_blocks = final_message.content
     usage = normalize_usage(provider="anthropic", model=model, usage_obj=getattr(final_message, "usage", None))
+
+    # Patch thinking_tokens back in from the captured stream-event details.
+    if captured_output_token_details is not None and usage.get("thinking_tokens") is None:
+        tt = captured_output_token_details.get("thinking_tokens")
+        if tt is not None:
+            try:
+                tt_int = int(tt)
+            except (TypeError, ValueError):
+                tt_int = None
+            if tt_int is not None:
+                usage["thinking_tokens"] = tt_int
+                if usage.get("details") is None:
+                    usage["details"] = {}
+                usage["details"]["thinking_tokens"] = tt_int
 
     # Extract thinking and text blocks, and rebuild content_blocks with valid text
     from anthropic.types import TextBlock, ThinkingBlock
@@ -603,6 +808,7 @@ def _generate_openai_response(
     model: str,
     max_tokens: int,
     _thinking_budget: int,
+    effort: str | None = None,
 ) -> tuple[list, str, str, dict]:
     """Generate response using OpenAI API."""
     # Convert Anthropic-format history into plain text messages.
@@ -630,30 +836,53 @@ def _generate_openai_response(
             messages.append({"role": role, "content": content})
 
     if uses_openai_responses_api(model):
+        # GPT-5-family Responses API:
+        # - effort: none/minimal/low/medium/high/xhigh (docs default: medium). OpenAI has
+        #   no "max" — translate Anthropic's "max" to the highest supported level "xhigh"
+        #   so a shared EFFORT_A/B default works for both providers without per-model wiring.
+        # - summary: "auto"/"detailed"/"concise". Without this set, no reasoning summary
+        #   appears in the response even though the model still thinks (and we're billed).
+        #   Opting in to "auto" mirrors Anthropic's display="summarized".
+        _OPENAI_VALID_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        _OPENAI_EFFORT_TRANSLATE = {"max": "xhigh"}
+        raw_effort = (effort or "medium").lower()
+        resolved_effort = _OPENAI_EFFORT_TRANSLATE.get(raw_effort, raw_effort)
+        if resolved_effort not in _OPENAI_VALID_EFFORTS:
+            resolved_effort = "medium"
         api_params = {
             "model": model,
             "input": messages,
             "max_output_tokens": max_tokens,
-            # GPT-5-family reasoning models default to medium effort in the docs.
-            "reasoning": {"effort": "medium"},
+            "reasoning": {"effort": resolved_effort, "summary": "auto"},
         }
         if system_prompt:
             api_params["instructions"] = system_prompt
 
         response_text = ""
-        with client.responses.stream(**api_params) as stream:
-            for event in stream:
-                if event.type == "response.output_text.delta":
-                    print(event.delta, end="", flush=True)
-                    response_text += event.delta
+        final_response = None
+        for _attempt in range(3):
+            with client.responses.stream(**api_params) as stream:
+                for event in stream:
+                    if event.type == "response.output_text.delta":
+                        print(event.delta, end="", flush=True)
+                        response_text += event.delta
+                    elif event.type in {"response.completed", "response.incomplete"}:
+                        # A response can be incomplete after reaching an output
+                        # or context limit. Preserve its streamed text and usage.
+                        final_response = event.response
 
-            final_response = stream.get_final_response()
+            # A usable partial answer must not be retried because doing so would
+            # duplicate streamed text. Retry only a completely empty stream.
+            if final_response is not None or response_text:
+                break
 
-        if not response_text:
+        if not response_text and final_response is not None:
             response_text = final_response.output_text
 
+        response_text = _ensure_nonempty_text_response(response_text)
+
         reasoning_summaries = []
-        for item in getattr(final_response, "output", []):
+        for item in getattr(final_response, "output", []) if final_response is not None else []:
             if getattr(item, "type", None) != "reasoning":
                 continue
             for summary in getattr(item, "summary", []) or []:
@@ -662,7 +891,11 @@ def _generate_openai_response(
                     reasoning_summaries.append(text)
 
         content_blocks = [{"type": "text", "text": response_text}]
-        usage = normalize_usage(provider="openai", model=model, usage_obj=getattr(final_response, "usage", None))
+        usage = normalize_usage(
+            provider="openai",
+            model=model,
+            usage_obj=getattr(final_response, "usage", None) if final_response is not None else None,
+        )
         return content_blocks, "\n\n".join(reasoning_summaries), response_text, usage
 
     # Stream the response
@@ -677,8 +910,14 @@ def _generate_openai_response(
     if system_prompt:
         api_params["messages"] = [{"role": "system", "content": system_prompt}, *messages]
 
-    # Use max_completion_tokens for newer models (GPT-4o and later)
-    if "gpt-5" in model or "chatgpt-4o" in model or model == "gpt-4o":
+    # Use max_completion_tokens for newer models (GPT-4o and later, plus the
+    # floating `chat-latest` alias that points to current ChatGPT default).
+    if (
+        "gpt-5" in model
+        or "chatgpt-4o" in model
+        or model == "gpt-4o"
+        or model == "chat-latest"
+    ):
         api_params["max_completion_tokens"] = max_tokens
     else:
         api_params["max_tokens"] = max_tokens
@@ -704,6 +943,8 @@ def _generate_openai_response(
         if content:
             print(content, end="", flush=True)
             response_text += content
+
+    response_text = _ensure_nonempty_text_response(response_text)
 
     # Return Anthropic-compatible content blocks as plain dicts so the same history
     # structure can be fed back into either provider.
@@ -1427,9 +1668,8 @@ def _generate_grok_response(
             # Add message to chat
             if msg["role"] == "user":
                 chat.append(xai_user(text_content))
-            # Note: xAI SDK in stateless mode only needs user messages
-            # The assistant responses are managed internally when using previous_response_id
-            # For stateless without ID, we only send user messages
+            elif msg["role"] == "assistant":
+                chat.append(xai_assistant(text_content))
 
         # Generate response (sample() takes no arguments)
         response = chat.sample()

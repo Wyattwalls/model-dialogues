@@ -137,6 +137,8 @@ python3 list_models.py
 python3 list_models.py --google --details
 ```
 
+OpenAI `gpt-5*` ids are routed through the Responses API automatically. Registered models include `gpt-5.5`, `gpt-5.5-pro`, and `gpt-5.6-sol`; they work once your API key can access the corresponding model ID.
+
 ## Prompts
 
 The repository includes a public prompt directory:
@@ -181,7 +183,7 @@ Current notable cases:
 
 - Anthropic:
   - most thinking-capable Claude models use a fixed thinking budget
-  - `claude-opus-4-6` uses adaptive thinking, with the repo mapping the budget setting onto effort levels
+  - `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels
 - Google Gemini:
   - Gemini 3 models use `thinkingLevel=HIGH` with thoughts included
 - OpenRouter Kimi / GLM:
