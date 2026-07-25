@@ -14,3 +14,14 @@ system_prompt_*.txt
 =0.8.0
 prompts/private/*
 !prompts/private/.gitkeep
+
+# Local scratch scripts
+_run_one.py
+_run_three_fable.py
+_thinking_probe.py
+
+# Private working notes (not for publishing)
+PUBLIC_PUSH_CHECKLIST.md
+AI_INSTRUCTION_CONTEXT_SUMMARY.md
+FEEDBACK_PROMPT_CONVERSATIONS.md
+feedback_conversations.html
