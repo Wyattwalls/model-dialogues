@@ -183,7 +183,9 @@ Current notable cases:
 
 - Anthropic:
   - most thinking-capable Claude models use a fixed thinking budget
-  - `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels
+  - `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels (`low` / `medium` / `high` / `xhigh` / `max`)
+  - `claude-opus-5` has thinking on by default; the API only allows disabling it at `high` effort or below
+  - at `xhigh` / `max` effort, raise `--max-tokens` (e.g. `32000`–`64000`) so thinking does not crowd out the visible reply — `max_tokens` caps thinking + response combined, and the per-model default (16000 for most) can truncate long high-effort turns
 - Google Gemini:
   - Gemini 3 models use `thinkingLevel=HIGH` with thoughts included
 - OpenRouter Kimi / GLM:
@@ -196,6 +198,17 @@ Current notable cases:
   - uses the Responses API
   - default setup uses medium reasoning effort
   - `temperature` is not sent for GPT-5-family models in this path
+
+## Prompt Caching
+
+For Anthropic models the repo tags the system prompt and the rolling last message with `cache_control`, so each turn re-uses the previous turn's cached prefix.
+
+`--cache-ttl` selects the cache lifetime:
+
+- `1h` (default) - keeps the prefix cached across slow turns. At high/max effort a single turn can take longer than the 5-minute cache window, which would otherwise expire the prefix before the same model's next turn and force a full re-write every turn (zero cache reads).
+- `5m` - cheaper on cache writes (1.25x vs 2x base input) and fine for fast-cadence runs.
+
+Cache reads are billed at 0.1x base input for both TTLs.
 
 ## Cost Estimation
 
