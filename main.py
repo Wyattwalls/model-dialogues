@@ -198,7 +198,8 @@ def run_conversation(
     final_question_b: str = None,
     pricing_file: str | None = None,
     max_tokens: int | None = None,
-    cache_ttl: str = DEFAULT_CACHE_TTL
+    cache_ttl: str = DEFAULT_CACHE_TTL,
+    system_prompt_name: str | None = None
 ):
     """Run a conversation between two models with per-model settings.
 
@@ -305,6 +306,7 @@ def run_conversation(
 - Max Turns: {max_turns}
 - Max Tokens: {max_tokens if max_tokens is not None else "per-model default"}
 - Cache TTL: {cache_ttl} (Anthropic prompt caching)
+- System Prompt: {system_prompt_name if system_prompt_name else "params.py SYSTEM_PROMPT_A/B"}
 - Temperature A: {describe_temperature_config(model_a, temperature_a)}
 - Temperature B: {describe_temperature_config(model_b, temperature_b)}
 - Thinking A: {describe_thinking_config(model_a, thinking_budget_a, effort_a)}
@@ -351,6 +353,7 @@ System Prompt B: {system_prompt_b}
         "max_turns": max_turns,
         "max_tokens": max_tokens,
         "cache_ttl": cache_ttl,
+        "system_prompt_name": system_prompt_name,
         "temperature_a": temperature_a,
         "temperature_b": temperature_b,
         "thinking_budget_a": thinking_budget_a,
@@ -1090,6 +1093,16 @@ Examples:
              "5m is cheaper on writes (1.25x vs 2x) for fast-cadence runs."
     )
 
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Path under prompts/ to a system prompt applied to BOTH models "
+             "(e.g. public/standard.txt or private/anthropic-feedback-v1.txt). "
+             "Placeholders {assistant_name}/{developer}/{model}/{turns_per_model}/{max_turns} "
+             "are filled in per model. Default: SYSTEM_PROMPT_A / SYSTEM_PROMPT_B from params.py."
+    )
+
     args = parser.parse_args()
 
     if args.turns % 2 != 0:
@@ -1103,15 +1116,23 @@ Examples:
     effort_a, thinking_budget_a = _resolve_thinking(model_a, args.effort_a, args.thinking_budget_a)
     effort_b, thinking_budget_b = _resolve_thinking(model_b, args.effort_b, args.thinking_budget_b)
 
-    # Create system prompts for each model using separate prompts from params
-    system_prompt_a = params.SYSTEM_PROMPT_A.format(
+    # Create system prompts for each model. A --system-prompt file (path under
+    # prompts/) overrides SYSTEM_PROMPT_A/B and is applied to both models; the
+    # same placeholders are filled in per model.
+    if args.system_prompt:
+        raw_prompt_a = raw_prompt_b = params.load_prompt(args.system_prompt)
+    else:
+        raw_prompt_a = params.SYSTEM_PROMPT_A
+        raw_prompt_b = params.SYSTEM_PROMPT_B
+
+    system_prompt_a = raw_prompt_a.format(
         assistant_name=get_assistant_name(model_a),
         developer=get_developer_name(model_a),
         model=model_a,
         turns_per_model=actual_turns_per_model,
         max_turns=args.turns
     )
-    system_prompt_b = params.SYSTEM_PROMPT_B.format(
+    system_prompt_b = raw_prompt_b.format(
         assistant_name=get_assistant_name(model_b),
         developer=get_developer_name(model_b),
         model=model_b,
@@ -1154,5 +1175,6 @@ Examples:
         final_question_b=final_question_b,
         pricing_file=args.pricing_file,
         max_tokens=args.max_tokens,
-        cache_ttl=args.cache_ttl
+        cache_ttl=args.cache_ttl,
+        system_prompt_name=args.system_prompt
     )

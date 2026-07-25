@@ -155,6 +155,14 @@ If you want local-only prompts, put them in:
 
 That directory is intended for private prompts and is ignored by git.
 
+To use a prompt file as the system prompt for **both** models on a run, pass its path (relative to `prompts/`) via `--system-prompt`:
+
+```bash
+python3 main.py --system-prompt public/standard.txt
+```
+
+The `{assistant_name}`, `{developer}`, `{model}`, `{turns_per_model}`, and `{max_turns}` placeholders are filled in per model. Without the flag, the `SYSTEM_PROMPT_A` / `SYSTEM_PROMPT_B` values in `params.py` are used.
+
 ## Configuration
 
 The easiest way to change defaults is to edit `params.py`.
