@@ -26,6 +26,8 @@ MODEL_ALIASES = {
     # Convenience aliases for the current Opus API ids.
     # Claude Opus 5 — fixed id with no date suffix (GA July 2026).
     "opus-5": "claude-opus-5",
+    "opus-5.5": "claude-opus-5-5",
+    "claude-opus-5.5": "claude-opus-5-5",
     "claude-opus5": "claude-opus-5",
     "claude-opus-4.8": "claude-opus-4-8",
     "claude-opus-4.7": "claude-opus-4-7",
@@ -95,6 +97,7 @@ def get_model_version(model: str) -> str | None:
 
 # Anthropic models that support fixed-budget or adaptive thinking.
 THINKING_MODELS = {
+    "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
@@ -115,6 +118,7 @@ THINKING_MODELS = {
 # Anthropic models that use adaptive thinking (thinking: {type: "adaptive"}).
 # These models never use budget_tokens.
 ADAPTIVE_THINKING_MODELS = {
+    "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
@@ -128,6 +132,7 @@ ADAPTIVE_THINKING_MODELS = {
 # Adaptive-thinking models that reject temperature/sampling params entirely
 # and support the "xhigh" (and "max") effort level.
 XHIGH_EFFORT_MODELS = {
+    "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
@@ -542,11 +547,32 @@ def get_max_tokens(model: str, default: int = 16000) -> int:
     return MODEL_MAX_TOKENS.get(model, default)
 
 
-def _ensure_nonempty_text_response(response_text: str) -> str:
-    """Normalize empty or effectively empty model replies to a safe placeholder."""
-    if response_text and response_text.strip() not in {"", ".", "...", "*", "-", "[silence]"}:
-        return response_text
-    return "*silence*"
+# Runner notes. The runner never writes words for a model; when a turn has no
+# text it can pass on, it substitutes one of these clearly bracketed notes so both
+# models (and the transcript reader) can see what actually happened.
+EMPTY_RESPONSE_NOTE = "[Empty response]"
+REFUSAL_NOTE = "[Response blocked by classifier. Category: {category}]"
+
+
+def _empty_response_note(response_text: str) -> tuple[str, str | None]:
+    """Return (text to pass on, runner note or None).
+
+    Provider APIs reject an empty or whitespace-only turn in the history, so such a
+    reply is replaced with EMPTY_RESPONSE_NOTE. Any reply with visible characters,
+    including "." or "...", is passed on exactly as the model wrote it.
+    """
+    if response_text and response_text.strip():
+        return response_text, None
+    return EMPTY_RESPONSE_NOTE, EMPTY_RESPONSE_NOTE
+
+
+def _record_runner_note(usage: dict, note: str | None) -> None:
+    """Flag in the usage details that this turn's text is a runner note."""
+    if note is None:
+        return
+    if usage.get("details") is None:
+        usage["details"] = {}
+    usage["details"]["runner_note"] = note
 
 
 def generate_response(
@@ -765,9 +791,9 @@ def _generate_anthropic_response(
     usage = normalize_usage(provider="anthropic", model=model, usage_obj=getattr(final_message, "usage", None))
 
     # Record why the turn ended. Claude 5.x models can stop with "refusal" (a
-    # safety classifier declined); without this the turn would just look like
-    # "*silence*" in the transcript. No server-side fallback is configured, so a
-    # refusal is never silently answered by a different model.
+    # safety classifier blocked the turn, possibly mid-thinking with no text at
+    # all). No server-side fallback is configured, so a refusal is never silently
+    # answered by a different model; instead a REFUSAL_NOTE is passed on (below).
     stop_reason = getattr(final_message, "stop_reason", None)
     if stop_reason is not None:
         if usage.get("details") is None:
@@ -800,26 +826,39 @@ def _generate_anthropic_response(
     # Extract thinking and text blocks, and rebuild content_blocks with valid text
     from anthropic.types import TextBlock, ThinkingBlock
 
-    reasoning_text = ""
-    response_text = ""
+    thinking_parts = []
+    text_parts = []
     new_content_blocks = []
 
     for block in content_blocks:
-        if hasattr(block, 'thinking'):
-            reasoning_text = block.thinking
-            new_content_blocks.append(block)
-        elif hasattr(block, 'text'):
-            response_text = block.text
-            # Keep text blocks that have substantial content
-            if response_text and response_text.strip() not in ["", ".", "...", "*", "-", "[silence]"]:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            # The API rejects whitespace-only text blocks in history; drop those,
+            # keep every other text block exactly as written.
+            if block.text and block.text.strip():
+                text_parts.append(block.text)
                 new_content_blocks.append(block)
+        else:
+            # thinking / redacted_thinking blocks go back to the model unchanged.
+            if block_type == "thinking" and getattr(block, "thinking", None):
+                thinking_parts.append(block.thinking)
+            new_content_blocks.append(block)
 
-    # If response_text is empty or only punctuation/whitespace, use a placeholder
-    # (Anthropic API requires non-empty, substantial text content blocks)
-    if not response_text or response_text.strip() in ["", ".", "...", "*", "-", "[silence]"]:
-        response_text = "*silence*"
-        # Add a text block with meaningful placeholder
-        new_content_blocks.append(TextBlock(type="text", text="*silence*"))
+    reasoning_text = "\n\n".join(thinking_parts)
+    response_text = "".join(text_parts)
+
+    # A blocked or empty turn gets a bracketed runner note, never invented text.
+    # On a mid-reply refusal the partial text is kept and the note follows it.
+    note = None
+    if stop_reason == "refusal":
+        category = ((usage.get("details") or {}).get("stop_details") or {}).get("category") or "unknown"
+        note = REFUSAL_NOTE.format(category=category)
+    elif not response_text.strip():
+        note = EMPTY_RESPONSE_NOTE
+    if note is not None:
+        new_content_blocks.append(TextBlock(type="text", text=note))
+        response_text = f"{response_text}\n\n{note}" if response_text.strip() else note
+        _record_runner_note(usage, note)
 
     return new_content_blocks, reasoning_text, response_text, usage
 
@@ -903,7 +942,7 @@ def _generate_openai_response(
         if not response_text and final_response is not None:
             response_text = final_response.output_text
 
-        response_text = _ensure_nonempty_text_response(response_text)
+        response_text, runner_note = _empty_response_note(response_text)
 
         reasoning_summaries = []
         for item in getattr(final_response, "output", []) if final_response is not None else []:
@@ -920,6 +959,7 @@ def _generate_openai_response(
             model=model,
             usage_obj=getattr(final_response, "usage", None) if final_response is not None else None,
         )
+        _record_runner_note(usage, runner_note)
         return content_blocks, "\n\n".join(reasoning_summaries), response_text, usage
 
     # Stream the response
@@ -968,13 +1008,14 @@ def _generate_openai_response(
             print(content, end="", flush=True)
             response_text += content
 
-    response_text = _ensure_nonempty_text_response(response_text)
+    response_text, runner_note = _empty_response_note(response_text)
 
     # Return Anthropic-compatible content blocks as plain dicts so the same history
     # structure can be fed back into either provider.
     content_blocks = [{"type": "text", "text": response_text}]
 
     usage = normalize_usage(provider="openai", model=model, usage_obj=usage_obj)
+    _record_runner_note(usage, runner_note)
     return content_blocks, "", response_text, usage
 
 
@@ -1628,12 +1669,13 @@ def _generate_gemini_response(
     # Gemini rejects a history containing an empty turn ("Requests ending with a
     # model turn are not supported"), and models sometimes deliberately reply
     # with nothing once a conversation winds down.
-    response_text = _ensure_nonempty_text_response(response_text)
+    response_text, runner_note = _empty_response_note(response_text)
 
     # Return Anthropic-compatible content blocks
     content_blocks = [{"type": "text", "text": response_text}]
 
     usage = normalize_usage(provider="gemini", model=model, usage_obj=usage_obj)
+    _record_runner_note(usage, runner_note)
     return content_blocks, reasoning_text, response_text, usage
 
 

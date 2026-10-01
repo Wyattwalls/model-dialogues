@@ -191,14 +191,14 @@ Current notable cases:
 
 - Anthropic:
   - most thinking-capable Claude models use a fixed thinking budget
-  - `claude-sonnet-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels (`low` / `medium` / `high` / `xhigh` / `max`)
+  - `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels (`low` / `medium` / `high` / `xhigh` / `max`)
   - `claude-opus-5` has thinking on by default; the API only allows disabling it at `high` effort or below
+  - `claude-opus-5-5` always thinks (it cannot be disabled) and rejects `temperature`; the API's default effort for it is `medium`, but the repo defaults it to `high` so runs stay comparable with `claude-opus-5`
   - `claude-sonnet-5-5` defaults to `high` effort (the same as the API default); it rejects `temperature`, so none is sent
-  - each Claude turn records its `stop_reason` in the state file; a `refusal` (safety classifier decline) or `max_tokens` stop is also printed as a warning. No server-side fallback model is configured, so a refused turn is never answered by a different model
+  - each Claude turn records its `stop_reason` in the state file; a `refusal` (safety classifier decline) or `max_tokens` stop is also printed as a warning. No server-side fallback model is configured, so a refused turn is never answered by a different model. A refused turn is passed on as `[Response blocked by classifier. Category: <category>]` (after any partial text the model had already written), so both models can see what happened
   - at `xhigh` / `max` effort, raise `--max-tokens` (e.g. `32000`–`64000`) so thinking does not crowd out the visible reply — `max_tokens` caps thinking + response combined, and the per-model default (16000 for most) can truncate long high-effort turns
 - Google Gemini:
   - Gemini 3 models (including `gemini-3.8-flash`) use `thinkingLevel=HIGH` with thoughts included
-  - an empty Gemini reply (models sometimes choose silence) is replaced with `*silence*`, as for other providers, because the Gemini API rejects a history containing an empty turn
 - OpenRouter Kimi / GLM:
   - use OpenRouter's `reasoning` parameter
   - the repo captures streamed `reasoning_details` and carries them forward in assistant history
@@ -209,6 +209,15 @@ Current notable cases:
   - uses the Responses API
   - default setup uses medium reasoning effort
   - `temperature` is not sent for these models in this path
+
+## Runner Notes
+
+The runner never writes words for a model. Two situations need something in place of a reply, because provider APIs reject an empty turn in the history; in both, a bracketed note is passed on to the other model and written to the transcript:
+
+- `[Empty response]`: the model returned no text (or only whitespace). Replies with any visible characters, such as `.` or `...`, are passed on exactly as written.
+- `[Response blocked by classifier. Category: <category>]`: a Claude safety classifier stopped the turn (`stop_reason: refusal`). Any text written before the block is kept, followed by the note.
+
+Turns that carry a note have `runner_note` set in their usage details in the `.state.json`. Transcripts recorded before this change used the placeholder `*silence*` for both cases, and also replaced replies of exactly `.`, `...`, `*`, `-` or `[silence]` with it.
 
 ## Prompt Caching
 

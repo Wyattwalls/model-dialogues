@@ -9,7 +9,6 @@ import os
 import json
 import argparse
 import subprocess
-import re
 import tempfile
 import uuid
 from datetime import datetime
@@ -58,7 +57,6 @@ from costing import (
 # Load environment variables from .env file
 load_dotenv()
 
-TURN_MARKER_PATTERN = re.compile(r"(?:\n{0,2})?System: Commencing turn \d+ of \d+\.?")
 
 
 def create_turn_tracking_message(next_model_name: str, total_turn_num: int, max_turns: int) -> dict:
@@ -160,24 +158,6 @@ def describe_temperature_config(model: str, temperature: float) -> str:
 def should_inject_turn_marker(model: str) -> bool:
     """Return whether the runner should append inline turn markers for a model."""
     return False
-
-
-def sanitize_turn_marker_echo(model: str, content_blocks: list, response_text: str) -> tuple[list, str]:
-    """Strip echoed turn-marker text from model replies for sensitive models."""
-    if should_inject_turn_marker(model):
-        return content_blocks, response_text
-
-    cleaned_response_text = TURN_MARKER_PATTERN.sub("", response_text).strip()
-    cleaned_blocks = []
-    for block in content_blocks:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text") or ""
-            cleaned_text = TURN_MARKER_PATTERN.sub("", text).strip()
-            cleaned_blocks.append({**block, "text": cleaned_text})
-        else:
-            cleaned_blocks.append(block)
-
-    return cleaned_blocks, cleaned_response_text
 
 
 def run_conversation(
@@ -417,7 +397,6 @@ System Prompt B: {system_prompt_b}
                     max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
-                content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
                     {
@@ -463,7 +442,6 @@ System Prompt B: {system_prompt_b}
                     max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
-                content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
                     {
@@ -509,7 +487,6 @@ System Prompt B: {system_prompt_b}
                     max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
-                content_blocks_a, response_a = sanitize_turn_marker_echo(model_a, content_blocks_a, response_a)
                 est_cost_a = estimate_cost_usd(usage_a, pricing_doc)
                 run_metrics.append(
                     {
@@ -548,7 +525,6 @@ System Prompt B: {system_prompt_b}
                     max_tokens=max_tokens, cache_ttl=cache_ttl,
                     gemini_client=gemini_client, xai_client=xai_client, deepseek_client=deepseek_client
                 )
-                content_blocks_b, response_b = sanitize_turn_marker_echo(model_b, content_blocks_b, response_b)
                 est_cost_b = estimate_cost_usd(usage_b, pricing_doc)
                 run_metrics.append(
                     {

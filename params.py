@@ -20,6 +20,8 @@ def load_prompt(filename):
 # Set EFFORT_A/B or THINKING_BUDGET_A/B to a non-None value to override for all runs in that slot.
 MODEL_DEFAULTS = {
     # Adaptive-thinking models: effort only, no thinking_budget.
+    # Opus 5.5: the API default effort is "medium"; "high" keeps runs comparable with Opus 5.
+    "claude-opus-5-5":            {"effort": "high"},
     # Sonnet 5.5: "high" is also the API default for this model.
     "claude-sonnet-5-5":          {"effort": "high"},
     "claude-fable-5":             {"effort": "high"},
