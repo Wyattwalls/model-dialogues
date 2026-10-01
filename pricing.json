@@ -14,6 +14,7 @@
     "claude-opus-4-1-20250805": { "input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75 },
     "claude-opus-4-20250514": { "input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75 },
 
+    "claude-sonnet-5-5": { "input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5, "cache_write_1h": 4.0 },
     "claude-sonnet-4-6": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
     "claude-sonnet-4-5-20250929": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
     "claude-sonnet-4-20250514": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
@@ -28,6 +29,7 @@
 
     "gpt-5.5": { "input": 5.0, "output": 30.0, "cache_read": 0.5 },
     "gpt-5.5-pro": { "input": 30.0, "output": 180.0, "cache_read": 3.0 },
+    "gpt-6.1-sol": { "input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write": 2.5 },
     "gpt-5.6-sol": { "input": 5.0, "output": 30.0, "cache_read": 0.5, "cache_write": 6.25 },
     "chat-latest": { "input": 5.0, "output": 30.0, "cache_read": 0.5 },
     "gpt-5.2": { "input": 1.75, "output": 14.0, "cache_read": 0.175 },
@@ -53,6 +55,7 @@
     "gemini-3-flash-preview": { "input": 0.5, "output": 3.0, "cache_read": 0.05 },
     "gemini-3.1-flash-lite": { "input": 0.25, "output": 1.5, "cache_read": 0.025 },
     "gemini-3.5-flash": { "input": 1.5, "output": 9.0, "cache_read": 0.15 },
+    "gemini-3.8-flash": { "input": 0.75, "output": 3.75, "cache_read": 0.075, "_note": "introductory price through 2026-12-31; 1.50/7.50/0.15 from 2027-01-01" },
 
     "kimi-k2.5": { "input": 1.15, "output": 8.0 },
     "openrouter/moonshotai/kimi-k2.5": { "input": 0.45, "output": 2.2 },

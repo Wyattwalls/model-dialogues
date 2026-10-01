@@ -70,6 +70,7 @@ MODEL_VERSIONS = {
     "gpt-5.5": "GPT-5.5",
     "gpt-5.5-pro": "GPT-5.5 Pro",
     "gpt-5.6-sol": "GPT-5.6 SOL",
+    "gpt-6.1-sol": "GPT-6.1 Sol",
     "gpt-5.2-chat-latest": "GPT-5.2 (chat-latest snapshot)",
     "chat-latest": "GPT-5.5 Instant (chat-latest floating alias)",
     "grok-4.3": "Grok 4.3",
@@ -83,6 +84,7 @@ MODEL_VERSIONS = {
     "zai/glm-5": "GLM-5",
     "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
     "gemini-3.5-flash": "Gemini 3.5 Flash",
+    "gemini-3.8-flash": "Gemini 3.8 Flash",
 }
 
 
@@ -93,6 +95,7 @@ def get_model_version(model: str) -> str | None:
 
 # Anthropic models that support fixed-budget or adaptive thinking.
 THINKING_MODELS = {
+    "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
     "claude-opus-5",
@@ -112,6 +115,7 @@ THINKING_MODELS = {
 # Anthropic models that use adaptive thinking (thinking: {type: "adaptive"}).
 # These models never use budget_tokens.
 ADAPTIVE_THINKING_MODELS = {
+    "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
     "claude-opus-5",
@@ -124,6 +128,7 @@ ADAPTIVE_THINKING_MODELS = {
 # Adaptive-thinking models that reject temperature/sampling params entirely
 # and support the "xhigh" (and "max") effort level.
 XHIGH_EFFORT_MODELS = {
+    "claude-sonnet-5-5",
     "claude-fable-5",
     "claude-mythos-5",
     "claude-opus-5",
@@ -469,7 +474,7 @@ def is_glm_model(model: str) -> bool:
 
 def uses_openai_responses_api(model: str) -> bool:
     """Check if an OpenAI model should use the Responses API."""
-    return model.startswith("gpt-5") and not model.endswith("chat-latest")
+    return model.startswith(("gpt-5", "gpt-6")) and not model.endswith("chat-latest")
 
 
 def uses_openai_reasoning(model: str) -> bool:
@@ -758,6 +763,25 @@ def _generate_anthropic_response(
         final_message = stream.get_final_message()
     content_blocks = final_message.content
     usage = normalize_usage(provider="anthropic", model=model, usage_obj=getattr(final_message, "usage", None))
+
+    # Record why the turn ended. Claude 5.x models can stop with "refusal" (a
+    # safety classifier declined); without this the turn would just look like
+    # "*silence*" in the transcript. No server-side fallback is configured, so a
+    # refusal is never silently answered by a different model.
+    stop_reason = getattr(final_message, "stop_reason", None)
+    if stop_reason is not None:
+        if usage.get("details") is None:
+            usage["details"] = {}
+        usage["details"]["stop_reason"] = stop_reason
+        stop_details = getattr(final_message, "stop_details", None)
+        if stop_details is not None:
+            usage["details"]["stop_details"] = (
+                stop_details.model_dump() if hasattr(stop_details, "model_dump") else stop_details
+            )
+    if stop_reason == "refusal":
+        print(f"\n[WARNING: {model} stopped with stop_reason=refusal: {usage['details'].get('stop_details')}]", flush=True)
+    elif stop_reason == "max_tokens":
+        print(f"\n[WARNING: {model} hit max_tokens; reply is truncated]", flush=True)
 
     # Patch thinking_tokens back in from the captured stream-event details.
     if captured_output_token_details is not None and usage.get("thinking_tokens") is None:
@@ -1600,6 +1624,11 @@ def _generate_gemini_response(
         # Try to capture usage metadata from the last chunk
         if hasattr(chunk, 'usage_metadata'):
             usage_obj = chunk.usage_metadata
+
+    # Gemini rejects a history containing an empty turn ("Requests ending with a
+    # model turn are not supported"), and models sometimes deliberately reply
+    # with nothing once a conversation winds down.
+    response_text = _ensure_nonempty_text_response(response_text)
 
     # Return Anthropic-compatible content blocks
     content_blocks = [{"type": "text", "text": response_text}]

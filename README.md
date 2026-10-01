@@ -137,7 +137,7 @@ python3 list_models.py
 python3 list_models.py --google --details
 ```
 
-OpenAI `gpt-5*` ids are routed through the Responses API automatically. Registered models include `gpt-5.5`, `gpt-5.5-pro`, and `gpt-5.6-sol`; they work once your API key can access the corresponding model ID.
+OpenAI `gpt-5*` and `gpt-6*` ids are routed through the Responses API automatically. Registered models include `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.6-sol`, and `gpt-6.1-sol`; they work once your API key can access the corresponding model ID.
 
 ## Prompts
 
@@ -191,21 +191,24 @@ Current notable cases:
 
 - Anthropic:
   - most thinking-capable Claude models use a fixed thinking budget
-  - `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels (`low` / `medium` / `high` / `xhigh` / `max`)
+  - `claude-sonnet-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, and `claude-opus-4-6` use adaptive thinking, with the repo mapping the budget setting onto effort levels (`low` / `medium` / `high` / `xhigh` / `max`)
   - `claude-opus-5` has thinking on by default; the API only allows disabling it at `high` effort or below
+  - `claude-sonnet-5-5` defaults to `high` effort (the same as the API default); it rejects `temperature`, so none is sent
+  - each Claude turn records its `stop_reason` in the state file; a `refusal` (safety classifier decline) or `max_tokens` stop is also printed as a warning. No server-side fallback model is configured, so a refused turn is never answered by a different model
   - at `xhigh` / `max` effort, raise `--max-tokens` (e.g. `32000`–`64000`) so thinking does not crowd out the visible reply — `max_tokens` caps thinking + response combined, and the per-model default (16000 for most) can truncate long high-effort turns
 - Google Gemini:
-  - Gemini 3 models use `thinkingLevel=HIGH` with thoughts included
+  - Gemini 3 models (including `gemini-3.8-flash`) use `thinkingLevel=HIGH` with thoughts included
+  - an empty Gemini reply (models sometimes choose silence) is replaced with `*silence*`, as for other providers, because the Gemini API rejects a history containing an empty turn
 - OpenRouter Kimi / GLM:
   - use OpenRouter's `reasoning` parameter
   - the repo captures streamed `reasoning_details` and carries them forward in assistant history
 - Direct Z.AI GLM:
   - uses Z.AI's OpenAI-compatible API
   - captures `reasoning_content`
-- OpenAI GPT-5 family:
+- OpenAI GPT-5 / GPT-6 families:
   - uses the Responses API
   - default setup uses medium reasoning effort
-  - `temperature` is not sent for GPT-5-family models in this path
+  - `temperature` is not sent for these models in this path
 
 ## Prompt Caching
 
@@ -216,7 +219,11 @@ For Anthropic models the repo tags the system prompt and the rolling last messag
 - `1h` (default) - keeps the prefix cached across slow turns. At high/max effort a single turn can take longer than the 5-minute cache window, which would otherwise expire the prefix before the same model's next turn and force a full re-write every turn (zero cache reads).
 - `5m` - cheaper on cache writes (1.25x vs 2x base input) and fine for fast-cadence runs.
 
-Cache reads are billed at 0.1x base input for both TTLs.
+Cache reads are billed at 0.1x base input for both TTLs (some newer models are cheaper, e.g. `claude-sonnet-5-5` at $0.20/MTok).
+
+OpenAI GPT-6-era models also report prompt-cache writes (`cache_write_tokens`); these are billed at the model's `cache_write` rate in `pricing.json` (the input rate if unset).
+
+Anthropic cost estimates bill each cache write at its actual TTL: the usage breakdown reports how many written tokens went to the 1-hour cache, and those are billed at `cache_write_1h` from `pricing.json` (2x input if unset), while the rest use `cache_write` (the 5-minute rate). Runs saved before this change billed all writes at the 5-minute rate, which under-reported 1-hour-TTL runs by roughly 10%.
 
 ## Cost Estimation
 

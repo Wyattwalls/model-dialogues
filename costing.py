@@ -33,6 +33,8 @@ class ModelPricing:
     output_per_1m: float
     cache_read_per_1m: float | None = None
     cache_write_per_1m: float | None = None
+    # Anthropic 1-hour cache writes. Defaults to 2x input when not set.
+    cache_write_1h_per_1m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,17 @@ def normalize_usage(
             details["cache_read_input_tokens"] = cache_read
         if cache_creation is not None:
             details["cache_creation_input_tokens"] = cache_creation
+        # cache_creation breaks writes down by TTL; 1h writes cost 2x input
+        # versus 1.25x for 5m, so the split matters for billing.
+        cache_creation_1h = None
+        cc_breakdown = getattr(usage_obj, "cache_creation", None)
+        if cc_breakdown is not None:
+            if isinstance(cc_breakdown, dict):
+                cache_creation_1h = _as_int(cc_breakdown.get("ephemeral_1h_input_tokens"))
+            else:
+                cache_creation_1h = _as_int(getattr(cc_breakdown, "ephemeral_1h_input_tokens", None))
+        if cache_creation_1h is not None:
+            details["cache_creation_1h_input_tokens"] = cache_creation_1h
         # output_tokens_details.thinking_tokens reports the full thinking tokens
         # billed for adaptive/extended thinking, even when display="omitted"
         # makes the thinking content invisible in the response. Capturing it
@@ -133,6 +146,7 @@ def normalize_usage(
                 "total_tokens": total_tokens,
                 "cache_read_tokens": cache_read,
                 "cache_creation_tokens": cache_creation,
+                "cache_creation_1h_tokens": cache_creation_1h,
                 "thinking_tokens": thinking_tokens,
                 "details": details or None,
             }
@@ -172,11 +186,14 @@ def normalize_usage(
         # prompt_tokens_details. Other compatible providers may use top-level
         # prompt_cache_hit_tokens.
         cache_read = None
+        cache_write = None
         prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
         if prompt_details is None:
             prompt_details = getattr(usage_obj, "input_tokens_details", None)
         if prompt_details is not None:
             cache_read = _as_int(getattr(prompt_details, "cached_tokens", None))
+            # GPT-6-era models report prompt-cache writes, billed above the input rate.
+            cache_write = _as_int(getattr(prompt_details, "cache_write_tokens", None))
             if hasattr(prompt_details, "__dict__"):
                 details["prompt_tokens_details"] = dict(prompt_details.__dict__)
         if cache_read is None:
@@ -191,6 +208,7 @@ def normalize_usage(
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
                 "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_write,
                 "details": details or None,
             }
         )
@@ -207,9 +225,9 @@ def normalize_usage(
             details["thoughts_token_count"] = thoughts_tokens
             # Google bills thinking tokens at the output rate but exposes them
             # as a separate count; fold them into output for correct billing.
-            if output_tokens is not None:
-                details["visible_output_tokens"] = output_tokens
-                output_tokens = output_tokens + thoughts_tokens
+            # A thoughts-only reply (no visible text) omits candidates_token_count.
+            details["visible_output_tokens"] = output_tokens or 0
+            output_tokens = (output_tokens or 0) + thoughts_tokens
 
         if cache_read is not None:
             details["cached_content_token_count"] = cache_read
@@ -328,6 +346,7 @@ def _parse_pricing_entry(
             float(out),
             cache_read_per_1m=_optional_float(entry.get("cache_read")),
             cache_write_per_1m=_optional_float(entry.get("cache_write")),
+            cache_write_1h_per_1m=_optional_float(entry.get("cache_write_1h")),
         )
     except (TypeError, ValueError):
         return None
@@ -370,8 +389,9 @@ def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Opt
     Provider semantics differ:
     - Anthropic: input_tokens is the uncached portion only; cache reads and
       writes are billed in addition.
-    - OpenAI / Gemini / DeepSeek: cache_read_tokens are a subset of
-      input_tokens. The uncached portion = input_tokens - cache_read_tokens.
+    - OpenAI / Gemini / DeepSeek: cache_read_tokens (and, for OpenAI models
+      that report them, cache_creation_tokens) are subsets of input_tokens.
+      The uncached portion = input_tokens - cache_read - cache_creation.
     """
     model = usage.get("model")
     if not model:
@@ -397,17 +417,26 @@ def estimate_cost_usd(usage: dict[str, Any], pricing_doc: dict[str, Any]) -> Opt
     cache_write_rate = mp.cache_write_per_1m if mp.cache_write_per_1m is not None else mp.input_per_1m
 
     if provider == "anthropic":
+        # `cache_write` is the 5-minute rate (1.25x input); 1-hour writes bill at
+        # 2x input unless pricing.json sets `cache_write_1h`.
+        cache_creation_1h = min(usage.get("cache_creation_1h_tokens") or 0, cache_creation)
+        cache_write_1h_rate = (
+            mp.cache_write_1h_per_1m if mp.cache_write_1h_per_1m is not None else 2 * mp.input_per_1m
+        )
         cost = (
             input_tokens * mp.input_per_1m
             + cache_read * cache_read_rate
-            + cache_creation * cache_write_rate
+            + (cache_creation - cache_creation_1h) * cache_write_rate
+            + cache_creation_1h * cache_write_1h_rate
             + output_tokens * mp.output_per_1m
         )
     else:
-        uncached_input = max(0, input_tokens - cache_read)
+        # Cache reads and (OpenAI) cache writes are both subsets of input_tokens.
+        uncached_input = max(0, input_tokens - cache_read - cache_creation)
         cost = (
             uncached_input * mp.input_per_1m
             + cache_read * cache_read_rate
+            + cache_creation * cache_write_rate
             + output_tokens * mp.output_per_1m
         )
 
